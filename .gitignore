@@ -1,0 +1,35 @@
+# "Jarvis MK II" tracks only the JARVIS assistant.
+#
+# This folder is shared with several unrelated projects - a Pokemon bot, a Rift
+# bot, a Dynamax bot, debug session dumps, Android APKs and ~15 MB of debug
+# screenshots. None of that belongs in this repository, so the ignore rules
+# below work as a whitelist: ignore everything, then re-include only the JARVIS
+# paths. That way a new stray file is excluded by default rather than having to
+# be remembered here.
+#
+# Nothing on disk is deleted. These patterns only affect what git tracks.
+
+# Ignore every top-level entry by default.
+*
+
+# Re-include the JARVIS project.
+!.gitignore
+!/jarvis/
+!/jarvis/**
+!/jarvis_tests/
+!/jarvis_tests/**
+!/README.md
+!/requirements.txt
+
+# ...but never the build/runtime noise, which lives inside those directories too.
+# These come last so they win over the re-include rules above.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local state that belongs on the machine, not in the repo.
+.env
+*.log
+_shots/
