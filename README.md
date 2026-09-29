@@ -258,6 +258,41 @@ holds the model for `30m`, which costs 3.4 GB resident (measured as the
 across an ordinary pause. Lower `keep_alive` to `5m` if that RAM is worth more
 to you than the latency.
 
+### Where a vision turn's 360 seconds went
+
+The worst turn on record was **360.27s**. It is not one slow call. It is a chain
+of cold prefills inside a single turn, and every piece was measured separately.
+
+| Piece | Cost | Why |
+| --- | --- | --- |
+| Vision describe, new image | **68–90s** | 1,051 image tokens at ~13 tok/s; images prefill about 3x slower than text |
+| First brain round, 38 tools | **90–130s** | ~4,800 prompt tokens at ~36 tok/s, cold |
+| Brain round after the tool result | **~92s** | the tool result changes the tail, so the round is re-prefilled |
+| Model load | **3.8–6.6s** | not the tail, and memory pressure is not the mechanism |
+| Generation | **5–15s** | ~7 tok/s, reply-length dependent |
+
+The pieces that *look* like the cause and are not, each ruled out by a
+measurement rather than an argument:
+
+- **The three-question describe is not three expensive questions.** Only the
+  first pays the image. Measured on the same image, the three cost 0.68s, 0.69s
+  and 1.46s once the image is prefilled, and a different image puts the first
+  back to 87.92s. The cost is per *image*, not per question.
+- **A model load is seconds, not minutes.** Evicting the describe model and
+  timing the reload gave 3.82–6.60s, so the outlier is not disk.
+- **The vision model does not evict the brain's cache.** A ~4,800-token brain
+  prompt stayed warm across a vision call on this machine (0.15s prefill before
+  and after), so the two models are not contending for one cache slot.
+
+What *is* a lever is the size of the tool result, because the round after the
+tool re-prefills it. `look_at_screen` was sending the same screen three times:
+`text_preview` (600 chars), `text` (up to 4000), and a full `elements` list in
+which every element repeated its own text. On a text-dense window the element
+list alone reached tens of thousands of characters, which at ~36 tok/s is about
+seven seconds per thousand characters. The payload now sends exactly what the tool
+promises — the text once, plus the actionable elements with coordinates — which
+removes roughly 2,600–3,000 characters (about 18s of prefill) from every look.
+
 Dropping tools from the front of the set was measured and rejected. It does cut
 the cold turn, but routing falls off a cliff, because this model will not
 reliably reach for `list_more_tools` when the tool it wants is missing:
@@ -849,7 +884,7 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-382 tests, about 26 seconds, no external network and no model needed. They
+389 tests, about 27 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor

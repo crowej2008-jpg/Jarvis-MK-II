@@ -101,7 +101,15 @@ def look_at_screen(question: str = "", store: bool = True,
     perception = _perception()
     obs = perception.observe(force=True)
 
-    payload: dict[str, Any] = obs.to_dict()
+    payload: dict[str, Any] = obs.to_dict(include_elements=False)
+    # The full element list was the bulk of this payload and it tripled the OCR
+    # text: every element's own text, the 4000-char text below, and the 600-char
+    # text_preview all carried the same screen. The tool promises "the text it
+    # can read, the clickable elements with coordinates", so send exactly that:
+    # text once, plus the actionable elements the model can act on. This payload
+    # is fed back to the brain, which re-prefills it on the round after the
+    # tool, at ~36 tokens/s, so ~1000 chars saved is ~7s off every look.
+    payload.pop("text_preview", None)
     # OCR text is the primary channel when the chat model cannot see images, so
     # give it far more than the short preview the observation record keeps.
     payload["text"] = obs.text[:4000]

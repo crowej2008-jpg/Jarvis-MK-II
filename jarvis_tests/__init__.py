@@ -5375,5 +5375,142 @@ class TestLoopbackHostResolution(unittest.TestCase):
                          "http://ollama.lan:11434")
 
 
+class TestLookPayloadIsLean(unittest.TestCase):
+    """look_at_screen fed the brain the same screen three times over.
+
+    The payload carried text_preview (600 chars), text (up to 4000), and a full
+    elements list in which every element repeated its own text. On a text-dense
+    window the element list alone can be tens of thousands of characters. That
+    payload goes back to the brain, which re-prefills it on the round after the
+    tool at roughly 36 tokens/s, so every duplicate thousand characters is about
+    seven seconds of a real turn.
+
+    The tool's own description promises "the text it can read, the clickable
+    elements with coordinates" and nothing more, so these pin exactly that.
+    """
+
+    def setUp(self):
+        from jarvis.perception import Element, Observation
+        from jarvis.tools import sight_tools
+
+        self.tools = sight_tools
+        self.Observation = Observation
+        self.Element = Element
+        self._saved = dict(sight_tools._state)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self.tools._state.clear()
+        self.tools._state.update(self._saved)
+
+    def _install(self, obs, describe_available=False):
+        class _Perception:
+            def observe(self_inner, force=False):
+                return obs
+
+        class _Vision:
+            def describe_available(self_inner):
+                return describe_available
+
+            def describe(self_inner, *_a, **_kw):
+                raise AssertionError("the vision model should not have been called")
+
+        class _Vis:
+            def record(self_inner, *_a, **_kw):
+                return 1
+
+        class _Cfg:
+            vlm_escalate_on_blank = True
+            vlm_describe_model = "qwen2.5vl:3b"
+            screen_memory_enabled = False
+
+        self.tools._state.clear()
+        self.tools._state.update({
+            "cfg": _Cfg(), "perception": _Perception(), "vision": _Vision(),
+            "memory": _Vis(), "chat": None, "autonomy": None, "locator": None,
+        })
+
+    def _obs(self, text, elements=()):
+        return self.Observation(
+            ts=1.0, window_app="notepad", window_title="Notepad",
+            width=1920, height=1200, text=text, elements=list(elements),
+            change=0.0, thumb_path="",
+        )
+
+    def test_the_full_element_list_is_not_sent(self):
+        obs = self._obs("hello world", [
+            self.Element("Save", 10, 10, 40, 20, 90.0, True),
+        ])
+        self._install(obs)
+        out = self.tools.look_at_screen(store=False)
+        self.assertNotIn("elements", out,
+                         "the full element list triples the OCR text and is not "
+                         "what the tool promises")
+
+    def test_text_preview_is_not_sent_beside_the_full_text(self):
+        obs = self._obs("x" * 900)
+        self._install(obs)
+        out = self.tools.look_at_screen(store=False)
+        self.assertNotIn("text_preview", out,
+                         "text_preview is a prefix of text and is pure duplication")
+
+    def test_the_text_is_still_sent_once(self):
+        obs = self._obs("a distinctive phrase")
+        self._install(obs)
+        out = self.tools.look_at_screen(store=False)
+        self.assertEqual(out["text"], "a distinctive phrase")
+
+    def test_long_text_is_still_capped(self):
+        obs = self._obs("y" * 9000)
+        self._install(obs)
+        out = self.tools.look_at_screen(store=False)
+        self.assertEqual(len(out["text"]), 4000)
+        self.assertTrue(out["truncated"])
+
+    def test_clickable_elements_still_carry_their_coordinates(self):
+        obs = self._obs("hello", [
+            self.Element("Save", 10, 20, 40, 20, 90.0, True),
+            self.Element("just a label", 50, 60, 80, 20, 90.0, False),
+        ])
+        self._install(obs)
+        out = self.tools.look_at_screen(store=False)
+        self.assertEqual([e["text"] for e in out["clickable"]], ["Save"])
+        self.assertEqual(out["clickable"][0]["centre"], [30, 30])
+
+    def test_the_element_count_is_still_reported(self):
+        obs = self._obs("hello", [
+            self.Element("a", 1, 1, 2, 2, 1.0, False),
+            self.Element("b", 3, 3, 2, 2, 1.0, True),
+        ])
+        self._install(obs)
+        out = self.tools.look_at_screen(store=False)
+        self.assertEqual(out["element_count"], 2)
+
+    def test_a_dense_screen_payload_is_much_smaller_than_before(self):
+        import json
+
+        text = " ".join(f"word{i}" for i in range(800))
+        elements = [
+            self.Element(f"word{i}", i, i, 100, 20, 90.0, i % 5 == 0)
+            for i in range(120)
+        ]
+        obs = self._obs(text, elements)
+        self._install(obs)
+        out = self.tools.look_at_screen(store=False)
+        lean = len(json.dumps(out))
+        old = len(json.dumps({
+            **obs.to_dict(),
+            "text": text[:4000],
+            "truncated": len(text) > 4000,
+            "clickable": [
+                e.as_dict() for e in obs.actionable_elements()[:30]
+            ],
+            "element_count": len(obs.elements),
+        }))
+        self.assertLess(lean, old * 0.75,
+                        f"the payload should be markedly smaller (was {old}, "
+                        f"now {lean})")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
