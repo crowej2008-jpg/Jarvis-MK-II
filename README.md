@@ -277,6 +277,124 @@ Replies stream, so text appears as it is generated.
 `request_timeout` is 420s rather than something tighter precisely because the
 cold first turn is legitimately slow, and a timeout there is a false failure.
 
+### Answering fast: the no-tools path
+
+Sending the 38-tool working set is the most expensive thing JARVIS does, and most
+questions need none of it. Measured on a warm session, same questions both ways:
+
+| Question | Tools sent | Time to first output |
+| --- | --- | --- |
+| How do I bake sourdough bread | 0 | **0.95s** |
+| Tell me a short joke about a duck | 0 | **0.39s** |
+| How do I bake sourdough bread | 38 | 8.97s |
+| Tell me a short joke about a duck | 38 | 7.65s |
+
+The tool schemas are most of the prompt, so leaving them out is worth roughly an
+order of magnitude. A question that shows no sign of wanting a tool is asked
+without any.
+
+**The gate leans deliberately towards the tools**, because the two failure modes
+are not symmetric — a slow correct answer is fine, a fast wrong one is not. A
+question takes the slow path if any of these hold:
+
+- it contains a word from the tool tag vocabulary (`TOOL_TAGS`);
+- it contains an action verb (`FAST_PATH_BLOCKING_VERBS`);
+- an image is attached;
+- the request is empty.
+
+The verb list exists because the tag vocabulary has a gap that is only visible in
+use. None of "open notepad", "launch the browser", "install firefox" or "find my
+keys" contains a single tag word, and all four are obvious tool calls. Verbs are
+matched as whole words, so "opening hours" and "running water" stay on the fast
+path.
+
+Politeness is deliberately *not* in that list. "Can you", "could you" and "please"
+appear in almost every request, including ones that need nothing, so blocking on
+them would send nearly all traffic down the slow path and the fast path would
+never run.
+
+**And the guess can admit it lost.** If a no-tools answer comes back as a refusal
+— "I don't have access to that" — the gate misfired, and JARVIS spends the slow
+call after all rather than telling the user it cannot do the thing it just did
+twenty times a day. `fast_path_refused()` is that check, and
+`test_a_refusal_gets_retried_with_tools_instead_of_returned` holds it in place.
+
+One thing that needed fixing once measured: tag matching was plain substring
+matching, so "sourdough **bread**" contained the file tag "**read**" and sent a
+baking question to the filesystem tools. Single-word tags are now matched on word
+boundaries; multi-word ones are phrases and are matched as they are.
+
+Set `fast_path = false` in the config to always send the tools.
+
+### Hearing you back quickly: the acknowledgement cue
+
+A warm turn is 15–30s, and silence is what makes a long wait feel broken rather
+than slow. So JARVIS acknowledges the moment it has a transcript, before it starts
+thinking.
+
+| Step | Cost |
+| --- | --- |
+| Build the 45ms tone | 0.03ms |
+| Write it to an already-open output stream | **0.22–2.52ms** |
+| **Total before the cue is audible** | **under 3ms** |
+
+That clears the 50ms bar, and the only reason it can is that there is no file to
+read and no codec to run — the tone is generated into a NumPy buffer
+(`ack_tone`), so the whole cost is one `stream.write`.
+
+**It is a tone, not a phrase, on purpose.** Spoken acknowledgements were rejected
+for a specific reason: the same synthesiser that would speak the acknowledgement
+would then speak the answer, and queueing one behind the other delays the answer —
+the part the user is actually waiting for. A cue cannot do that, and does not read
+as a fake reply.
+
+**The output stream is opened at startup, and primed.** This was the real
+finding. Opening a `sounddevice.OutputStream` costs ~200ms here, and the *first
+write* costs a further ~220ms while the driver primes — measured, not estimated.
+Paid at reply time, the first cue of a session lands 923ms after the user stopped
+talking, which is worse than the 236ms it was meant to cover. So `VoiceLoop.run()`
+calls `warm_ack_stream()` while idle, which opens the stream and writes 20ms of
+silence. Inaudible, and it moves the whole cost off the critical path:
+
+| | Cue latency |
+| --- | --- |
+| Opened at reply time | 923ms first, then 0.26–0.32ms |
+| Warmed at startup | 2.52ms first, then 0.22–0.28ms |
+
+A zero-length write does not prime the driver, which is why the warm-up writes
+real samples of silence.
+
+The stream is process-wide and shared, because TTS and the cue want the same
+output device and two independent `OutputStream`s on one Windows device reliably
+produces exclusive-mode errors. If the device cannot be opened at all, that
+failure is latched: a missing sound card costs one attempt, not one per turn,
+forever, and the turn continues silently. There is deliberately no `sd.play()`
+fallback, because it opens and closes its own stream and would cost the ~200ms
+this cue exists to avoid, on every turn, forever.
+
+Set `acknowledge_sound = ""` to turn the cue off, or pick another of `tick`,
+`chime`, `blip`, `soft`.
+
+### What 50ms is and is not
+
+Worth being precise, because "respond in 50ms" has a floor under it. Measured on
+this machine:
+
+| | Time |
+| --- | --- |
+| Localhost round trip, no model work | 8.7–16.2ms |
+| Fastest possible model output (perfect cache hit, one token) | **236ms** |
+| Time to first output, no tools | 0.33s |
+| Time to first output, 38 tools, cold | 103.0s |
+
+A complete model-generated answer in 50ms is not reachable by tuning: the fastest
+single token ever observed here was 236ms, so 50ms is 5–10x below the floor. A
+smaller model does not fix it either — at 100 tok/s, 10ms per token, this hardware
+generates at 6.5–8.9 tok/s.
+
+What 50ms *can* cover is acknowledging you, which is what the cue is for, plus
+genuinely fast answers on the no-tools path, which measures 0.39–1.69s.
+
 ### Choosing a model
 
 `qwen2.5:3b-instruct` is the default because it is the only installed model that
@@ -529,11 +647,12 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-306 tests, about 20 seconds, no external network and no model needed. They
+338 tests, about 26 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor
-geometry, microphone selection, and the prompt helpers.
+geometry, microphone selection, the no-tools fast path, the acknowledgement cue,
+and the prompt helpers.
 The routing added for tool selection is covered the same way: keyword
 pre-loading, the memory-question patterns, and the evidence filter that stops a
 search result from counting the question itself or the model's own past wrong
@@ -554,6 +673,28 @@ Selection is deterministic, but that only makes a *repeated* question hit the
 cache — it does not rescue a new one, because a different question picks a
 different tool set. That asymmetry is the whole reason the default is 0, and no
 amount of test coverage can make it go away.
+
+The no-tools fast path has two classes, split by what kind of bug they are
+looking for. `TestFastPathGate` is about the *judgement*: that a plain question
+is let through, that a tool-ish one is not, that the verb check catches the gap
+the tag vocabulary leaves ("open notepad"), that it does not fire on substrings
+("opening hours", "running water"), that politeness does not force every request
+down the slow path, and that a refusal is detected without mistaking an ordinary
+answer for one — a false positive there throws away a good answer and pays the
+slow call for nothing. `TestFastPathRouting` is about the *wiring*: that a simple
+question is answered with zero tools sent, that a tool request is offered the
+tools, that a refusal triggers the retry, and that `fast_path = false` and an
+attached image both take the slow way.
+
+The acknowledgement cue is covered by `TestAcknowledgeCue`, which pins the claims
+this README makes: that the buffer is short, quiet and zero at both ends so it
+cannot click; that it actually oscillates rather than being a window of silence;
+that the stream is written to rather than played synchronously; that
+`VoiceLoop.run()` warms it and `_run_turn()` fires the cue *before* calling the
+model; that the stream is shared across cues rather than reopened per turn; that
+a dead output device is latched instead of retried every turn; that the warm-up
+primes the driver with real samples of silence; and that queueing a cue costs
+under 50ms.
 
 Prompt-cache stability is covered too, because it is invisible until it is
 expensive: that `system_prompt()` does not change when the clock moves, that the
@@ -774,6 +915,8 @@ Useful ones:
 | `keep_last_messages` | `8` | How much raw conversation to replay each turn. **The most expensive setting here, and it looks free.** `recent()` takes the *newest* n rows, so the window slides every turn, the token after the system prompt changes, and the whole history block becomes unreusable. Mean warm prefill: 62.4s at 40, 3.7s at 8, 0.7s at 0. Facts and notes reach the model through the cached system prompt, so this only buys anaphora — raise it only with a measurement |
 | `num_predict` | `400` | Reply cap. Generation runs at 6.5–8.9 tok/s on CPU, so this is also the main lever on how long a turn feels: 400 tokens is ~50s |
 | `tool_select_max` | `0` | How many tools, chosen by relevance to the utterance, reach the prompt per turn. All 72 stay registered; this only narrows what is shown. `0`, the default, sends every core tool every turn, which keeps the prompt byte-identical so the cache keeps hitting. **Leave it at 0:** raising it cuts the cold turn from 68s to 45s but costs 15–40s on every *new* question, which is the common case. It does improve routing, 20/20 requests finding their tool against 13/20, so it is worth revisiting on hardware with faster prefill |
+| `fast_path` | `true` | Ask questions that show no sign of wanting a tool without attaching any tool schemas. Worth about an order of magnitude: 0.39–1.69s to first output against 7.65–8.97s with the 38-tool block. The gate is lopsided towards the tools on purpose, and a refusal from a no-tools answer is retried properly rather than returned. `false` always sends the tools |
+| `acknowledge_sound` | `tick` | Short tone played once the transcript exists, before thinking starts, so a 15–30s wait does not feel broken. Under 3ms from cue to audible. `""` disables it; `chime`, `blip` and `soft` also work. The output stream is opened and primed at startup, because opening it costs ~200ms and the driver's first write a further ~220ms |
 | `confirm_destructive` | `true` | Ask before dangerous tools. `--confirmation` overrides per run |
 | `autonomy_allowlist` | see config | Apps trusted by default |
 | `autonomy_denylist` | see config | Never touch, cannot be overridden |
