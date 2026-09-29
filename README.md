@@ -476,12 +476,21 @@ thinking.
 | Step | Cost |
 | --- | --- |
 | Build the 45ms tone | 0.03ms |
-| Write it to an already-open output stream | **0.22–2.52ms** |
-| **Total before the cue is audible** | **under 3ms** |
+| Write it to an already-open output stream | **0.31–1.10ms** |
+| **Total before the cue is queued** | **under 2ms** |
+| Device buffer ahead of it | **~182ms** |
+| **Cue to audible** | **~183ms** |
 
-That clears the 50ms bar, and the only reason it can is that there is no file to
-read and no codec to run — the tone is generated into a NumPy buffer
-(`ack_tone`), so the whole cost is one `stream.write`.
+That clears the 50ms *queuing* bar, and the only reason it can is that there is no
+file to read and no codec to run — the tone is generated into a NumPy buffer
+(`ack_tone`), so the whole cost is one `stream.write`. It does **not** mean the
+user hears it in 2ms. The output device holds ~182ms of buffer here (the figure
+`sounddevice` reports as `stream.latency`), and the tone cannot reach the speaker
+until what is ahead of it has played, so the honest cue-to-ear figure is about
+**183ms**. That is measured with the cues spaced out; called back to back, a 45ms
+tone fills the stream's own buffer and the next write blocks for the tone length,
+which is what made a naive loop report ~50ms of "write" time that was really
+playback.
 
 **It is a tone, not a phrase, on purpose.** Spoken acknowledgements were rejected
 for a specific reason: the same synthesiser that would speak the acknowledgement
@@ -497,7 +506,7 @@ talking, which is worse than the 236ms it was meant to cover. So `VoiceLoop.run(
 calls `warm_ack_stream()` while idle, which opens the stream and writes 20ms of
 silence. Inaudible, and it moves the whole cost off the critical path:
 
-| | Cue latency |
+| | Cue queued |
 | --- | --- |
 | Opened at reply time | 923ms first, then 0.26–0.32ms |
 | Warmed at startup | 2.52ms first, then 0.22–0.28ms |
@@ -507,10 +516,12 @@ real samples of silence.
 
 The live loop prints `(acknowledged in Nms)`, and that number is deliberately not
 the cue latency. `_acknowledge()` runs `play_ack` on a daemon thread and returns,
-so the printed figure is the cost of handing the tone off — sub-millisecond —
-while the number that matters, cue to audible, is the 0.22–2.52ms above. It also
-fires only *after* transcription: the ~1.3s of speech-to-text happens first,
-because a cue before a transcript would be acknowledging the wrong thing.
+so the printed figure is only the cost of handing the tone off — sub-millisecond,
+and nothing to do with when it is heard. The real figure is the ~183ms above,
+dominated by the device buffer. The cue also fires only *after* transcription, so
+the ~1.5s of speech-to-text happens first; a cue before a transcript would be
+acknowledging the wrong thing. Measured in-harness on real synthesized speech, a
+3.19s utterance transcribes in a median of 1.52s.
 
 The stream is process-wide and shared, because TTS and the cue want the same
 output device and two independent `OutputStream`s on one Windows device reliably
@@ -534,14 +545,18 @@ this machine:
 | Fastest possible model output (perfect cache hit, one token) | **236ms** |
 | Time to first output, no tools | 0.33s |
 | Time to first output, 38 tools, cold | 103.0s |
+| Speech to text, 3.19s of speech (median) | **1.52s** |
+| Cue to audible, from the transcript | ~183ms |
 
 A complete model-generated answer in 50ms is not reachable by tuning: the fastest
 single token ever observed here was 236ms, so 50ms is 5–10x below the floor. A
 smaller model does not fix it either — at 100 tok/s, 10ms per token, this hardware
 generates at 6.5–8.9 tok/s.
 
-What 50ms *can* cover is acknowledging you, which is what the cue is for, plus
-genuinely fast answers on the no-tools path, which measures 0.39–1.69s.
+What 50ms *can* cover is acknowledging you, which is what the cue is for — it
+reaches the ear in ~183ms, which is not 50ms but is fast enough to read as "I
+heard you" — plus genuinely fast answers on the no-tools path, which measures
+0.39–1.69s.
 
 ### Choosing a model
 
@@ -1226,7 +1241,7 @@ Useful ones:
 | `num_predict` | `400` | Reply cap. Generation runs at 6.5–8.9 tok/s on CPU, so this is also the main lever on how long a turn feels: 400 tokens is ~50s |
 | `tool_select_max` | `0` | How many tools, chosen by relevance to the utterance, reach the prompt per turn. All 72 stay registered; this only narrows what is shown. `0`, the default, sends every core tool every turn, which keeps the prompt byte-identical so the cache keeps hitting. **Leave it at 0:** raising it cuts the cold turn from 68s to 45s but costs 15–40s on every *new* question, which is the common case. It does improve routing, 20/20 requests finding their tool against 13/20, so it is worth revisiting on hardware with faster prefill |
 | `fast_path` | `true` | Ask questions that show no sign of wanting a tool without attaching any tool schemas. Worth about an order of magnitude: 0.39–1.69s to first output against 7.65–8.97s with the 38-tool block. The gate is lopsided towards the tools on purpose, and a refusal from a no-tools answer is retried properly rather than returned. `false` always sends the tools |
-| `acknowledge_sound` | `tick` | Short tone played once the transcript exists, before thinking starts, so a 15–30s wait does not feel broken. Under 3ms from cue to audible. `""` disables it; `chime`, `blip` and `soft` also work. The output stream is opened and primed at startup, because opening it costs ~200ms and the driver's first write a further ~220ms |
+| `acknowledge_sound` | `tick` | Short tone played once the transcript exists, before thinking starts, so a 15–30s wait does not feel broken. Queued in under 2ms and reaching the ear in ~183ms, the difference being the output device's ~182ms buffer. `""` disables it; `chime`, `blip` and `soft` also work. The output stream is opened and primed at startup, because opening it costs ~200ms and the driver's first write a further ~220ms |
 | `confirm_destructive` | `true` | Ask before dangerous tools. `--confirmation` overrides per run |
 | `autonomy_allowlist` | see config | Apps trusted by default |
 | `autonomy_denylist` | see config | Never touch, cannot be overridden |
