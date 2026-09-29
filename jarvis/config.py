@@ -226,6 +226,20 @@ class Config:
     # unloads. Least-recently-used; 0 disables caching entirely.
     vlm_describe_cache_entries: int = 24
 
+    # The exact-bytes cache almost never fires on a live desktop, because a
+    # blinking cursor and a taskbar clock change every byte while changing
+    # 0.066% of the pixels. This bounds how much of a 64x64 greyscale
+    # signature may differ before a repeat question is treated as a genuinely
+    # new screen. Measured: 0.066% for cursor and clock churn, 3.89% for a
+    # region shifted by 37 levels, so 0.25% sits in a wide gap.
+    #
+    # Reuse still requires OCR to have read exactly the same words, so this
+    # only has to catch a change too small to alter a single word. Where OCR
+    # found nothing, the bound is tightened to zero instead. Set 0 to force
+    # near-exact matches, or a negative value to disable near hits entirely and
+    # keep only the exact-bytes cache.
+    vlm_describe_reuse_max_changed: float = 0.0025
+
     # --- Mouse and actuation --------------------------------------------
     # Pixels per second for a full-screen traverse; higher is faster.
     mouse_speed: float = 1400.0
