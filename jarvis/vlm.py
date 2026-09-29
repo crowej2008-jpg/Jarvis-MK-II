@@ -12,12 +12,14 @@ starting point and then verified against a screen diff, never trusted blindly.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import math
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -86,11 +88,16 @@ class Vision:
         self.max_side = int(getattr(cfg, "vlm_max_side", 896))
         # Describing sends a smaller image than pointing, but the size is close
         # to irrelevant to latency: measured with qwen2.5vl on a real 1920x1200
-        # window, a describe call reported 1112 prompt tokens at 112px, 224px,
-        # 320px, 448px and 896px alike, because the model pads whatever it gets
-        # to a fixed token grid. One call is 78-93s here and ~97% of that is
-        # prefilling those tokens, so the small size is kept only to keep the
-        # payload small. Pointing keeps full resolution, where detail matters.
+        # window, a describe call reported 1099 prompt tokens at 96px, 128px,
+        # 168px, 224px, 336px, 448px, 560px, 672px, 896px and 1120px alike,
+        # because the model pads whatever it gets to a fixed token grid.
+        # Cropping does not help either, for the same reason. So the small size
+        # is kept only to keep the payload small. Pointing keeps full
+        # resolution, where detail matters.
+        #
+        # That cost is paid once per distinct image, not once per question.
+        # See _describe_cache: re-asking identical bytes costs 0.5ms per token
+        # rather than 78ms, so an unchanged screen is cheap after the first ask.
         self.describe_max_side = int(getattr(cfg, "vlm_describe_max_side", 448) or 448)
         self.num_predict = int(getattr(cfg, "vlm_num_predict", 256) or 256)
         self.describe_num_predict = int(
@@ -101,6 +108,71 @@ class Vision:
         )
         self._client = None
         self._installed_cache: dict[str, bool] = {}
+        # Descriptions of screens already described, keyed on the image bytes.
+        #
+        # The cost of describing is paid once per *distinct* image, not once per
+        # question, and the measurement was unambiguous. Same screenshot, three
+        # questions: 71.74s, then 6.28s, then 3.11s. Change one region by 40
+        # levels and it goes back to 91.66s. The first call prefills ~1100 image
+        # tokens at ~78ms each; every later call on identical bytes prefills at
+        # 0.5ms/token, because ollama caches the vision encoder result against
+        # the image.
+        #
+        # So an unchanged screen is already cheap to re-ask, but only inside one
+        # process, and only while the model is still loaded. Caching it here
+        # makes a repeat description free and independent of both, which is the
+        # difference between "the screen is the same as last time" costing 85
+        # seconds and costing nothing.
+        self._describe_cache: "OrderedDict[str, str]" = OrderedDict()
+        # Question text is part of the key: the same screen asked a different
+        # question is a different answer, and answering the wrong question
+        # quickly would be worse than answering slowly. 0 disables the cache,
+        # which is the honest setting when a screen is expected to change
+        # between every question anyway.
+        self._describe_cache_max = max(
+            0, int(getattr(cfg, "vlm_describe_cache_entries", 24) or 0)
+        )
+
+    def _image_key(self, image: np.ndarray, question: str, model: str) -> str:
+        """A cache key over the exact bytes the model would be sent.
+
+        Deliberately hashes the encoded payload rather than the array: the
+        bytes are what ollama's own cache keys on, so this cache and the
+        server's agree about what "the same image" means. That means a hit here
+        predicts a fast call there, rather than the two disagreeing.
+        """
+        payload, _scale, _size = self._prepare(image, self.describe_max_side)
+        digest = hashlib.sha256(payload.encode("ascii")).hexdigest()
+        return f"{model}|{question.strip()}|{digest}"
+
+    def _describe_cached(
+        self, key: str, produce: Callable[[], str]
+    ) -> tuple[str, bool]:
+        """Return (answer, was_hit) for `key`, computing it if absent.
+
+        Only a usable answer is stored. The usability check lives here rather
+        than in the callers so that a confabulation cannot be cached: `_ask`
+        returns text that is frequently junk, and caching that would leave the
+        screen permanently undescribable, because every later call would be a hit
+        on the junk and the miss would never be retried.
+        """
+        if self._describe_cache_max <= 0:
+            return produce(), False
+        hit = self._describe_cache.get(key)
+        if hit is not None:
+            self._describe_cache.move_to_end(key)
+            log.info("describe cache hit for %r", key[:12])
+            return hit, True
+        answer = produce()
+        if answer and self._usable(answer):
+            self._describe_cache[key] = answer
+            # Bounded, and least-recently-used evicted. A long session on a
+            # screen that changes constantly should not grow without limit.
+            while len(self._describe_cache) > self._describe_cache_max:
+                self._describe_cache.popitem(last=False)
+        elif answer:
+            log.info("describe answer for %r unusable, not caching it", key[:12])
+        return answer, False
 
     # -- plumbing --------------------------------------------------------
     def _get_client(self):
@@ -241,20 +313,26 @@ class Vision:
         that as "no visual information", never as an empty description.
         """
         if question.strip():
-            answer = self._ask(image, self._question_prompt(question),
-                               model=self.describe_model,
-                               max_side=self.describe_max_side,
-                               num_predict=self.describe_num_predict)
+            key = self._image_key(image, question, self.describe_model)
+            answer, _hit = self._describe_cached(key, lambda: self._ask(
+                image, self._question_prompt(question),
+                model=self.describe_model,
+                max_side=self.describe_max_side,
+                num_predict=self.describe_num_predict,
+            ))
             return answer if self._usable(answer) else ""
 
         deadline = time.monotonic() + self.describe_budget
 
         if self._ocr_is_rich(ocr_text):
+            key = self._image_key(image, self._SINGLE_PROMPT, self.describe_model)
             try:
-                answer = self._ask(image, self._SINGLE_PROMPT,
-                                   model=self.describe_model,
-                                   max_side=self.describe_max_side,
-                                   num_predict=self.describe_num_predict)
+                answer, _hit = self._describe_cached(key, lambda: self._ask(
+                    image, self._SINGLE_PROMPT,
+                    model=self.describe_model,
+                    max_side=self.describe_max_side,
+                    num_predict=self.describe_num_predict,
+                ))
             except VLMUnavailable:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -262,13 +340,32 @@ class Vision:
                 return ""
             return answer if self._usable(answer) else ""
 
+        key = self._image_key(image, "|".join(self._DETAIL_PROMPTS),
+                              self.describe_model)
+        answer, _hit = self._describe_cached(
+            key, lambda: self._multi_pass(image, deadline)
+        )
+        return answer
+
+    def _multi_pass(self, image: np.ndarray, deadline: float) -> str:
+        """The three-question path, factored out so it caches as one unit.
+
+        Only the *first* question is expensive. Measured on a real screen with
+        qwen2.5vl: 71.74s, then 6.28s, then 3.11s against the same image bytes,
+        because the first call is what pays the ~1100 image tokens at ~78ms each
+        and ollama keeps the vision-encoder result for the rest. Change one
+        region by 40 levels and it is back to 91.66s.
+
+        So the cost is per *image*, not per question. The budget below therefore
+        protects against a genuinely cold image or a model that is slow for some
+        other reason, not against three questions each costing 80-90s as the
+        old comment here claimed.
+        """
         parts: list[str] = []
         for prompt in self._DETAIL_PROMPTS:
-            # Each of these prefills the image from scratch on a cold cache, and
-            # that is ~80-90s apiece on this CPU, so three of them is four to
-            # five minutes for one description. The budget turns "wait longer"
-            # into "answer with less", which is the right way round: a partial
-            # description arrives, instead of nothing arriving eventually.
+            # The budget turns "wait longer" into "answer with less", which is
+            # the right way round: a partial description arrives, instead of
+            # nothing arriving eventually.
             if time.monotonic() > deadline:
                 log.info("describe gave up after %d of %d questions: "
                          "budget of %.0fs spent",

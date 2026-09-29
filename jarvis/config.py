@@ -180,9 +180,13 @@ class Config:
     # qwen2.5vl was measured against moondream on the same 1920x1200 window.
     # moondream returned "urn:jira:issue/uid:..." and a coordinate list where an
     # application name was asked for. qwen2.5vl read the screen text back
-    # correctly, verbatim. It costs 30-70s per call on this CPU versus about
-    # 1s, which is why it is only asked one question and OCR still supplies the
-    # text. Set this to "" to go back to moondream for describing too.
+    # correctly, verbatim. Set this to "" to go back to moondream for describing
+    # too, though that was measured to be a false economy: moondream prefills in
+    # ~14s where qwen2.5vl takes ~80s, but it is not a usable substitute. Asked
+    # about a deliberately photo-like screen with no text on it, it answered
+    # "urn of water" where qwen2.5vl answered "a window showing a beach", and on
+    # a blank screen it returned nothing at all. Escalating would cost 16s + 80s
+    # and end up slower than simply waiting.
     vlm_describe_model: str = "qwen2.5vl:3b"
     vlm_timeout: float = 300.0
     # When OCR finds nothing usable, escalate to the vision model automatically.
@@ -192,10 +196,16 @@ class Config:
     # Describing does not, but the reason is not legibility.
     #
     # Measured on this CPU, one qwen2.5vl describe call is 78-93s and ~97% of
-    # that is prefilling the image: the model reports 1112 prompt tokens at
-    # *every* size tried, from 112px to 448px, because it pads the image to a
-    # fixed token grid. Shrinking the picture therefore saves nothing, and
-    # vlm_describe_max_side is kept small only to keep the payload small.
+    # that is prefilling the image: the model reports 1099 prompt tokens at
+    # every size tried, from 96px to 1120px, and at every crop, because it pads
+    # the image to a fixed token grid. Shrinking the picture therefore saves
+    # nothing, and vlm_describe_max_side is kept small only to keep the payload
+    # small.
+    #
+    # That cost is per distinct image, not per call. Three questions against one
+    # screenshot took 71.74s, 6.28s and 3.11s, because the first call is what
+    # pays the image tokens and ollama keeps the result. Changing one region by
+    # 40 levels put the first one back to 91.66s. See vlm_describe_cache_entries.
     vlm_describe_max_side: int = 448
     # Cap on generated tokens. The useful answers are 15-25 tokens, so a high
     # cap only matters when the model degenerates: moondream once used all 256
@@ -204,11 +214,17 @@ class Config:
     vlm_num_predict: int = 256
     vlm_describe_num_predict: int = 96
     # Wall-clock ceiling for a whole describe, across all the questions it may
-    # ask. A blank screen takes the three-question path, and three unprefilled
-    # image calls is 4-5 minutes of waiting for one description. Once the budget
-    # is spent the remaining questions are skipped and whatever was gathered is
-    # returned, so the answer degrades instead of the user hanging.
+    # ask. This is now protection against a cold image or a model that is slow
+    # for some other reason, not against three questions each costing 80-90s:
+    # only the first question is expensive, because the image tokens are
+    # prefilled once per distinct screenshot.
     vlm_describe_budget_seconds: float = 150.0
+    # How many distinct screen descriptions to keep, keyed on the image bytes
+    # and the question. A repeat description of an unchanged screen is then
+    # free instead of costing another 71-91s, and the model's own image cache
+    # is not the thing being relied on, since that disappears when the model
+    # unloads. Least-recently-used; 0 disables caching entirely.
+    vlm_describe_cache_entries: int = 24
 
     # --- Mouse and actuation --------------------------------------------
     # Pixels per second for a full-screen traverse; higher is faster.
