@@ -531,8 +531,51 @@ answering slowly. Only a *usable* answer is stored: caching a confabulation
 would leave that screen permanently undescribable, since every later call would
 be a hit on the junk and the miss would never be retried.
 
-Set `vlm_describe_cache_entries` to 0 to disable it, which is the honest setting
-if the screen is expected to change between every question anyway.
+Set `vlm_describe_cache_entries` to 0 to disable it.
+
+**That cache does not fire on a real desktop, though.** Six grabs of the live
+screen, four seconds apart, produced six distinct images and *zero* exact-bytes
+hits, because a blinking cursor and a taskbar clock change every byte of a
+SHA-256 while changing 0.066% of the pixels. The table above is only reachable
+by passing the same array twice. In real use, every describe took ~85s.
+
+So there is a second, looser tier behind the exact one. A near hit needs **all
+three** of: the same question, the same OCR words, and an image signature that
+barely moved. OCR agreement is the load-bearing part — it is the model already
+trusted to have read the screen, and keying on the word *set* rather than the
+raw string means OCR respacing or reordering does not force a re-describe. The
+pixel bound is only a backstop for a change too small to alter a single word,
+such as a window dragging or a scrollbar thumb.
+
+Both halves of that bound were measured rather than guessed:
+
+| | Signature pixels differing, above the noise floor |
+| --- | --- |
+| Live screen, 5s apart (cursor, clock) | **0.0000%** |
+| A dialog opening | 10.7422% |
+| One line retyped in place | 1.4648% |
+
+The per-pixel floor is 24 greyscale levels, and it is not a compromise between
+those two. Of the pixels that differ at all during incidental churn, 99% are
+within 13 levels of where they were — antialiasing and a clock redrawing — so
+the two distributions do not overlap. `vlm_describe_reuse_max_changed` defaults
+to 0.0025, which sits in the gap.
+
+Against the real model on the real screen:
+
+| | Time |
+| --- | --- |
+| Cold screen, first ask | 95.59s |
+| Same screen 6s later, cursor moved, **different bytes** | **0.01s** |
+| Screen with a new word on it | 82.12s |
+
+Where OCR found nothing to agree about, the bound drops to requiring an exact
+signature match, because a screen we could not read at all is the screen where
+a confident wrong reuse is least defensible. The three-question path — the one
+reached *because* OCR had nothing usable — does not use the loose tier at all.
+
+Set `vlm_describe_reuse_max_changed` to 0 to force near-exact matches, or to a
+negative number to switch the loose tier off and keep only exact-bytes hits.
 
 **What still does not help, re-measured.** Swapping in the faster model is a
 false economy. `moondream` prefills 748 tokens in ~14s where `qwen2.5vl` takes
@@ -693,7 +736,7 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-349 tests, about 26 seconds, no external network and no model needed. They
+358 tests, about 26 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor
@@ -758,6 +801,21 @@ disabling it always asks, and — the one the code got wrong first time — that
 *unusable* answer is not stored, since caching a confabulation would leave that
 screen permanently undescribable. It also pins that the key follows the bytes
 actually sent to the model, so a hit here predicts a cheap call to the server.
+
+The looser reuse tier is tested against the failure it is most likely to cause,
+which is serving a stale description:
+
+- A cursor blink and a clock advancing **are** reused, since catching those is
+  the entire reason the tier exists.
+- A word appearing, or a word disappearing, is **not** reused even when the
+  image barely moved. This is the case the pixel bound alone would get wrong, and
+  the reason OCR agreement is the load-bearing half of the gate.
+- A real change with identical OCR text is **not** reused, which is what the
+  pixel backstop is for.
+- With no OCR to agree about, a nudge inside the loose bound is **not** reused.
+- Switching the tier off leaves only exact-bytes hits.
+- OCR reordering and respacing do **not** force a re-describe, which is what
+  makes the tier usable against real OCR rather than ideal OCR.
 
 Confirmation is covered as well: that a reply starts unconfirmed, that user
 rows cannot be marked confirmed, that a confirmed reply becomes evidence while
@@ -967,6 +1025,7 @@ Useful ones:
 | `vlm_describe_num_predict` | `96` | Generation cap for describing. Bounds degenerate output |
 | `vlm_describe_budget_seconds` | `150.0` | Wall-clock ceiling for a whole describe, across all its questions. `0` disables. Guards a cold image, not the per-question cost — only the first question is expensive |
 | `vlm_describe_cache_entries` | `24` | How many screen descriptions to keep, keyed on the image bytes and the question. Least-recently-used. A repeat description of an unchanged screen measured 0.01s against 81.89s cold; `0` disables |
+| `vlm_describe_reuse_max_changed` | `0.0025` | Fraction of a 64x64 greyscale signature allowed to differ before a repeat is treated as a new screen. Reuse also requires identical OCR words. Incidental cursor/clock churn measured 0.0000% above the 24-level noise floor, against 1.46% for a line retyped. Negative disables this looser tier |
 | `vlm_timeout` | `300.0` | Seconds before a vision call fails |
 | `request_timeout` | `420.0` | Seconds before a brain call fails |
 | `keep_alive` | `30m` | How long Ollama holds the model and its prompt cache. Costs 3.4 GB while resident; shortening it brings the 92s cold prefill back |

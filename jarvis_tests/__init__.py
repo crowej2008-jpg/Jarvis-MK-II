@@ -1929,6 +1929,12 @@ class TestVlmDescribeFailsFast(unittest.TestCase):
                 self.describe_budget = 150.0
                 self._describe_cache = OrderedDict()
                 self._describe_cache_max = 24
+                # The loose reuse tier needs these too, since describe() reads
+                # them for the question path. Left at -1 so this test is only
+                # about the pass sequence, not about reuse.
+                self._describe_near = OrderedDict()
+                self._describe_reuse_max_changed = -1
+                self._SIGNATURE_DELTA = 24
 
             def _ask(self, image, prompt, model="", max_side=None, num_predict=None):
                 asked.append(prompt)
@@ -4684,7 +4690,7 @@ class TestVlmDescribeCache(unittest.TestCase):
     to the server, and a changed screen is correctly a miss.
     """
 
-    def _vision(self, entries=24, answer="A terminal window."):
+    def _vision(self, entries=24, answer="A terminal window.", reuse=0.0025):
         from jarvis.vlm import Vision
 
         class Cfg:
@@ -4698,6 +4704,7 @@ class TestVlmDescribeCache(unittest.TestCase):
             vlm_describe_num_predict = 96
             vlm_describe_budget_seconds = 150.0
             vlm_describe_cache_entries = entries
+            vlm_describe_reuse_max_changed = reuse
 
         v = Vision(Cfg())
         self.asked: list[str] = []
@@ -4738,10 +4745,16 @@ class TestVlmDescribeCache(unittest.TestCase):
 
     def test_a_changed_screen_is_described_again(self):
         # The dangerous direction: a stale description served for a screen that
-        # has moved on is worse than no description at all.
+        # has moved on is worse than no description at all. A real visual
+        # change, at real screen dimensions - the 4x4 stand-in differs by a
+        # single intensity level, which is below the noise floor by design and
+        # so is correctly not treated as a change.
         v = self._vision()
-        v.describe(_fake_screen(1), "what is this window?")
-        v.describe(_fake_screen(2), "what is this window?")
+        first = np.full((600, 900, 3), 40, np.uint8)
+        second = first.copy()
+        second[150:500, 200:700] = 250
+        v.describe(first, "what is this window?")
+        v.describe(second, "what is this window?")
         self.assertEqual(len(self.asked), 2, "a changed screen reused a description")
 
     def test_a_different_question_is_a_different_answer(self):
@@ -4766,7 +4779,10 @@ class TestVlmDescribeCache(unittest.TestCase):
         self.assertEqual(len(self.asked), 1)
 
     def test_the_cache_is_bounded_and_evicts_the_least_recently_used(self):
-        v = self._vision(entries=2)
+        # reuse=-1 so this exercises the exact-bytes tier alone. With the loose
+        # tier on, an evicted entry would still be found by signature, which is
+        # the intended behaviour rather than a failure of eviction.
+        v = self._vision(entries=2, reuse=-1)
         for seed in (1, 2, 3):
             v.describe(_fake_screen(seed), "q")
         self.assertLessEqual(
@@ -4809,6 +4825,141 @@ class TestVlmDescribeCache(unittest.TestCase):
         k3 = v._image_key(_fake_screen(2), "q", "m")
         self.assertEqual(k1, k2, "the same pixels gave different keys")
         self.assertNotEqual(k1, k3, "different pixels gave the same key")
+
+    def test_a_cursor_blink_reuses_the_description(self):
+        # The measured reality: six grabs four seconds apart of a live screen
+        # gave six distinct images and zero exact-bytes hits, differing by
+        # 0.066% of pixels. If the loose tier does not catch that, the cache is
+        # decoration and every describe costs 85s again.
+        v = self._vision()
+        rich = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        quiet = _fake_screen(1)
+        blink = quiet.copy()
+        blink[3, 3] = (9, 9, 9)  # one pixel, like a cursor
+        a = v.describe(quiet, ocr_text=rich)
+        b = v.describe(blink, ocr_text=rich)
+        self.assertEqual(a, b)
+        self.assertEqual(len(self.asked), 1, f"re-asked {len(self.asked)} times")
+
+    def test_the_clock_advancing_reuses_the_description(self):
+        v = self._vision()
+        rich = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+ # A real screen shape, so a clock-sized region is genuinely a small fraction
+        # of the frame. On the 4x4 stand-in a few pixels are a quarter of it.
+        before = np.full((600, 900, 3), 60, np.uint8)
+        after = before.copy()
+        after[560:585, 820:890] = 66  # ~0.2%, like a clock ticking over
+        a = v.describe(before, ocr_text=rich)
+        b = v.describe(after, ocr_text=rich)
+        self.assertEqual(a, b)
+        self.assertEqual(len(self.asked), 1, f"re-asked {len(self.asked)} times")
+
+    def test_a_word_appearing_is_not_reused(self):
+        # The load-bearing part of the loose gate. A changed pixel count alone
+        # cannot tell a cursor from new text; agreeing OCR can. The new text is
+        # kept small on purpose - a few hundred pixels, well under the pixel
+        # bound - so this passes only because the words differ.
+        v = self._vision()
+        base = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        quiet = np.full((600, 900, 3), 40, np.uint8)
+        # ~0.17% of the frame, comfortably inside the 0.25% default bound.
+        noisy = quiet.copy()
+        noisy[300:315, 200:290] = 250
+        v.describe(quiet, ocr_text=base)
+        v.describe(noisy, ocr_text=base + " ERROR fatal exception denied")
+        self.assertEqual(len(self.asked), 2, "new on-screen words reused an old answer")
+
+    def test_a_word_disappearing_is_not_reused(self):
+        v = self._vision()
+        base = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        quiet = np.full((600, 900, 3), 40, np.uint8)
+        noisy = quiet.copy()
+        noisy[300:315, 200:290] = 250
+        v.describe(noisy, ocr_text=base)
+        v.describe(quiet, ocr_text=base.replace("saved", "here"))
+        self.assertEqual(len(self.asked), 2, "vanished words reused an old answer")
+
+    def test_a_real_change_is_not_reused_even_with_identical_ocr(self):
+        # Identical OCR text plus a substantially different image. This is the
+        # dangerous case the pixel backstop exists for: the words agree, so only
+        # the signature can notice that a different window is up.
+        v = self._vision()
+        rich = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        first = np.full((400, 600, 3), 20, np.uint8)
+        second = np.full((400, 600, 3), 200, np.uint8)
+        v.describe(first, ocr_text=rich)
+        v.describe(second, ocr_text=rich)
+        self.assertEqual(len(self.asked), 2, "a different window reused the description")
+
+    def test_reuse_needs_ocr_agreement_when_there_is_no_text(self):
+        # This path is reached precisely because OCR had nothing usable to say,
+        # so there is no corroboration and the bar is near-exact instead of
+        # merely close.
+        v = self._vision()
+        quiet = np.full((400, 600, 3), 30, np.uint8)
+        nudged = quiet.copy()
+        nudged[200:260, 300:460] = 34  # ~0.7% of pixels, well inside the loose bound
+        a = v.describe(quiet)
+        b = v.describe(nudged)
+        self.assertNotEqual(a, b, "reused with no OCR to agree with")
+        # The multi-question path, so three prompts each.
+        self.assertEqual(len(self.asked), 6, f"asked {len(self.asked)} times")
+
+    def test_the_loose_tier_can_be_switched_off(self):
+        # Leave only the exact-bytes cache, for anyone who would rather pay the
+        # 85s than have a tolerance at all.
+        v = self._vision(reuse=-1)
+        rich = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        blink = _fake_screen(1).copy()
+        blink[3, 3] = (9, 9, 9)
+        v.describe(_fake_screen(1), ocr_text=rich)
+        v.describe(blink, ocr_text=rich)
+        self.assertEqual(len(self.asked), 2, "the loose tier ran while switched off")
+
+    def test_ocr_word_order_does_not_force_a_re_describe(self):
+        # OCR wobbles on spacing and order constantly. Requiring the identical
+        # string would make the loose tier useless in exactly the live-desktop
+        # case it exists for.
+        v = self._vision()
+        rich = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        blink = _fake_screen(1).copy()
+        blink[3, 3] = (9, 9, 9)
+        v.describe(_fake_screen(1), ocr_text=rich)
+        v.describe(blink, ocr_text="  " + " ".join(reversed(rich.split())) + " ")
+        self.assertEqual(len(self.asked), 1, "reordering OCR text cost a re-describe")
+
+    def test_a_different_near_key_does_not_cross_over(self):
+        # Two different questions can each have a valid signature; they must not
+        # borrow each other's answers through the shared tier.
+        v = self._vision()
+        rich = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        v.describe(_fake_screen(1), ocr_text=rich)
+        v.describe(_fake_screen(1), "what is the app name?", ocr_text=rich)
+        self.assertEqual(len(self.asked), 2, "a different question reused a near hit")
 
     def test_the_key_separates_models(self):
         from jarvis.vlm import Vision
