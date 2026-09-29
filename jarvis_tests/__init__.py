@@ -4600,6 +4600,16 @@ class TestAcknowledgeCue(unittest.TestCase):
             voice.play_ack = real
         self.assertEqual(called, [], "an empty setting should produce no sound")
 
+    def test_shutting_down_releases_the_cue_output(self):
+        # The stream is held open for the whole session, so cues stay cheap.
+        # shutdown() also runs on a restart, and a held OutputStream keeps the
+        # output device, so the loop has to give it back.
+        import inspect
+
+        from jarvis.voice import VoiceLoop
+
+        self.assertIn("close_ack_stream", inspect.getsource(VoiceLoop.shutdown))
+
     def test_the_stream_is_warmed_when_the_loop_starts(self):
         # Without this, the first cue of the session pays the device open and
         # lands about 400ms after the user stopped talking.

@@ -17,7 +17,7 @@ from typing import Any, Callable
 import numpy as np
 
 from .assistant import Assistant
-from .audio import Mic, play_ack, warm_ack_stream
+from .audio import Mic, close_ack_stream, play_ack, warm_ack_stream
 from .stt import Listener, Transcript
 from .wake import WakeWord
 
@@ -320,4 +320,8 @@ class VoiceLoop:
             self.speaker.stop()
         self.mic.stop()
         self._stop_meter()
+        # The cue stream is held open for the whole session so cues stay fast.
+        # Close it on the way out: shutdown() also runs on a restart, and an
+        # OutputStream left open holds the output device.
+        close_ack_stream()
         self._say("  offline.")
