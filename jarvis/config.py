@@ -245,6 +245,32 @@ class Config:
     # 3.7s. Raising it re-breaks the cache, so do it only with a measurement.
     keep_last_messages: int = 8
 
+    # Ask questions that need no tool without attaching the 38-tool schema at
+    # all. Measured warm: 103.0s to first output with the schemas attached,
+    # 0.33s without them, because the schema block is most of the prompt.
+    #
+    # The gate is lopsided by design - any tool-ish word, any action verb or any
+    # attached image takes the slow path - and a no-tools answer that comes back
+    # as a refusal is retried properly rather than returned. Set false to always
+    # send the tools.
+    fast_path: bool = True
+
+    # Say something within a few tens of milliseconds of the user finishing
+    # speaking, then get on with the real answer.
+    #
+    # A warm turn is 15-30s, and silence is what makes a long wait feel broken
+    # rather than slow. Measured floor: a localhost round trip with nothing to
+    # do is 8.7-16.2ms, so a cue can land well inside 50ms. The real answer
+    # cannot: the fastest a single token ever came back was 236ms.
+    #
+    # Deliberately not speech. Any audible phrase needs the same synthesiser
+    # that will speak the answer a moment later, and queueing one behind the
+    # other would delay the answer. A short tone does not, and does not read as
+    # a fake reply.
+    #
+    # Set "" to turn the cue off entirely.
+    acknowledge_sound: str = "tick"
+
     # --- Home automation -------------------------------------------------
     home_assistant_url: str = ""
     home_assistant_token: str = ""

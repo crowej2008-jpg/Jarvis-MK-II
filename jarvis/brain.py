@@ -308,6 +308,93 @@ def _memory_evidence(rows: Iterable[Any], topic: str) -> list[dict[str, Any]]:
 # is the only way back to a tool that scoring left out, and it is not optional.
 TOOL_SELECTION_FLOOR = frozenset({"list_more_tools"})
 
+# --- the no-tools fast path -------------------------------------------------
+#
+# Sending the 38-tool working set is the most expensive thing this app does, and
+# most questions do not need any of it. Measured on a warm session: with the
+# tool schemas attached, time to first output was 103.0s; the same question
+# without them was 0.33s. So a question that provably needs no tool is asked
+# without them.
+#
+# "Provably" is doing real work in that sentence. The gate is deliberately
+# lopsided: anything that even looks like an action takes the slow path, because
+# a wrong fast answer is far worse than a slow one. Three things force the slow
+# path: a word from the tool tag vocabulary, an action verb (see below), and an
+# attached image. Only a clean bill of health gets the fast path.
+
+# The tag vocabulary above is a good "probably needs a tool" signal, but it has a
+# gap: "open notepad" contains no word from any tag, and obviously needs a tool.
+# So imperatives are checked separately, as whole words rather than substrings.
+FAST_PATH_BLOCKING_VERBS = frozenset({
+    "open", "launch", "start", "run", "execute", "close", "quit", "exit",
+    "install", "uninstall", "create", "delete", "rename", "find", "search",
+    "show", "display", "send", "email", "text", "call", "book", "order",
+    "download", "upload", "put", "lock", "log", "boot", "browse", "refresh",
+    "empty", "clear", "capture", "record", "play", "pause", "skip", "next",
+    "previous", "rewind", "unlock", "connect", "disconnect", "pair", "sync",
+})
+
+# Politeness and filler are deliberately NOT here. "can you", "could you" and
+# "please" appear in almost every request, including ones that need nothing,
+# and blocking on them would send nearly all traffic down the slow path.
+
+# The fast path is a bet, so it needs a way to admit it lost. If the model
+# answers a no-tools question by saying it cannot do it, the gate misfired and
+# the honest thing is to spend the slow call and find out.
+FAST_PATH_REFUSALS = (
+    "i don't have access",
+    "i do not have access",
+    "i don't have the ability",
+    "i do not have the ability",
+    "i can't help with",
+    "i cannot help with",
+    "i'm not able to",
+    "i am not able to",
+    "i cannot do that",
+    "i can't do that",
+    "i'm unable to",
+    "i am unable to",
+    "without access to",
+    "you would need to use",
+    "use the .* tool",
+)
+
+
+def needs_tools(user_text: str) -> bool:
+    """True when the utterance looks like it wants a tool. Lopsided on purpose.
+
+    False means "nothing here suggests an action", not "no tool could possibly
+    help". Every caller must treat a False as permission to try, never as
+    certainty, and must be ready to spend the slow call if the answer comes back
+    unusable.
+    """
+    low = (user_text or "").lower()
+    if not low.strip():
+        return True
+    for words in TOOL_TAGS.values():
+        for word in words:
+            # Substring matching on the tag vocabulary produced a false positive
+            # worth keeping in mind: "sourdough bread" contains "read", so
+            # "bread" sent a baking question to the file tools. Word boundaries
+            # for the single-word tags; the multi-word ones are phrases and are
+            # matched as they are.
+            if " " in word:
+                if word in low:
+                    return True
+            elif re.search(rf"\b{re.escape(word)}\b", low):
+                return True
+    tokens = set(re.findall(r"[a-z']+", low))
+    if tokens & FAST_PATH_BLOCKING_VERBS:
+        return True
+    return False
+
+
+def fast_path_refused(text: str) -> bool:
+    """Did a no-tools answer come back as a refusal? Then retry with tools."""
+    low = (text or "").lower()
+    return any(re.search(p, low) for p in FAST_PATH_REFUSALS)
+
+
 # Evidence a tool needs before it earns a place in the prompt. One word of the
 # tool's own name scores 2.0, a category keyword 3.0, so this admits those
 # plus a two-word description match while rejecting a single shared word.
@@ -782,6 +869,39 @@ class Brain:
                 )
 
         messages = self._messages(user_text, images)
+
+        # Try the question without any tool schemas first when it looks like
+        # pure conversation. The tool block is most of the prompt, so leaving it
+        # out is the difference between a sub-second answer and a two-minute
+        # one. See FAST_PATH_BLOCKING_VERBS for why the gate leans slow.
+        #
+        # An image always goes the slow way: the model can read an attached
+        # screenshot without help, but the follow-up usually needs a tool, and
+        # this is not the place to find out.
+        fast = (
+            bool(self.cfg.fast_path)
+            and not seen_images
+            and not needs_tools(user_text)
+        )
+        if fast:
+            text, tool_calls = self._round(messages, [], on_token)
+            if not tool_calls and text.strip() and not fast_path_refused(text):
+                log.info("fast path: answered %r with no tools", user_text[:60])
+                self.memory.add_message("user", user_text)
+                self.memory.add_message("assistant", text.strip())
+                return Reply(
+                    text=text.strip(),
+                    tool_calls=records,
+                    rounds=1,
+                    model=self.model or "",
+                    elapsed=time.time() - started,
+                )
+            # It asked for a tool it was not offered, or said it could not do
+            # it. Either way the gate guessed wrong, so spend the slow call.
+            log.info("fast path unhelpful for %r, retrying with tools", user_text[:60])
+            if self.on_thinking:
+                self.on_thinking("reconsidering")
+
         tools = self._tools(user_text)
         reply_text = ""
 
