@@ -5512,5 +5512,219 @@ class TestLookPayloadIsLean(unittest.TestCase):
                         f"now {lean})")
 
 
+class TestStartupWarming(unittest.TestCase):
+    """A cold first turn paid the model load and the whole tool-schema prefill.
+
+    Neither depends on the question, so both are moved to startup on a background
+    thread. These pin what the warm request actually is, because its whole value
+    is in matching what a real turn starts with: a warm that sent a different
+    prefix, or sent it synchronously and stalled startup, would buy nothing.
+    """
+
+    def test_the_defaults_warm_the_brain_and_leave_vision_off(self):
+        from jarvis.config import Config
+
+        cfg = Config()
+        self.assertTrue(cfg.warm_models)
+        self.assertFalse(cfg.warm_vision,
+                         "vision warming pins ~4.2 GB and is off by default")
+        self.assertEqual(cfg.vlm_keep_alive, "5m")
+
+    def _brain(self):
+        from jarvis.brain import Brain
+        from jarvis.config import load_config
+
+        cfg = load_config()
+        cfg.keep_alive = "30m"
+        cfg.num_ctx = 8192
+        brain = Brain.__new__(Brain)
+        brain.cfg = cfg
+        brain.model = "qwen2.5:3b-instruct"
+        brain.system_prompt = lambda: "SYSTEM PROMPT"
+        brain._tools = lambda user_text=None: [{"function": {"name": "open_app"}}]
+        brain.calls = []
+
+        class _Client:
+            host = "http://127.0.0.1:11434"
+
+            def chat(self_inner, **kw):
+                brain.calls.append(kw)
+                return {"message": {"content": ""}}
+
+        brain._client = _Client()
+        return brain
+
+    def test_the_warm_loads_the_model_and_prefills_system_plus_tools(self):
+        from jarvis.brain import Brain
+
+        brain = self._brain()
+        self.assertTrue(Brain.warm(brain))
+        self.assertEqual(len(brain.calls), 1)
+        kw = brain.calls[0]
+        self.assertEqual(kw["model"], "qwen2.5:3b-instruct")
+        self.assertEqual(kw["keep_alive"], "30m",
+                         "the warm must use the session's keep_alive, or it frees "
+                         "the model before the first turn gets to use it")
+        self.assertEqual(kw["options"]["num_predict"], 1,
+                         "the warm should stop after one token")
+        self.assertFalse(kw["stream"])
+        self.assertTrue(kw["tools"], "the tool schemas are most of the prefill")
+        self.assertEqual(kw["messages"][0]["role"], "system")
+        self.assertEqual(kw["messages"][0]["content"], "SYSTEM PROMPT")
+
+    def test_the_warm_sends_no_history_so_the_cached_prefix_is_reusable(self):
+        from jarvis.brain import Brain
+
+        brain = self._brain()
+        Brain.warm(brain)
+        self.assertEqual([m["role"] for m in brain.calls[0]["messages"]],
+                         ["system", "user"],
+                         "history belongs after the prefix, never inside the warm")
+
+    def test_a_failing_warm_returns_false_and_does_not_raise(self):
+        from jarvis.brain import Brain
+
+        brain = self._brain()
+
+        def boom(**_kw):
+            raise RuntimeError("ollama is down")
+
+        brain._client.chat = boom
+        self.assertFalse(Brain.warm(brain))
+
+    def _vision(self, model, describe, keep_alive="5m"):
+        from jarvis.config import load_config
+        from jarvis.vlm import Vision
+
+        cfg = load_config()
+        cfg.vlm_model = model
+        cfg.vlm_describe_model = describe
+        cfg.vlm_keep_alive = keep_alive
+        vision = Vision(cfg)
+        vision._installed = lambda _model: True
+        vision._prepare = lambda image, max_side=None: ("QUJD", 1.0, (8, 8))
+        vision.calls = []
+
+        class _Client:
+            def generate(self_inner, **kw):
+                vision.calls.append(kw)
+                return {"response": ""}
+
+        vision._client = _Client()
+        return vision
+
+    def test_the_vision_warm_loads_describe_then_point(self):
+        vision = self._vision("moondream", "qwen2.5vl:3b")
+        loaded = vision.warm()
+        self.assertEqual(loaded, {"qwen2.5vl:3b": True, "moondream": True})
+        self.assertEqual([c["model"] for c in vision.calls],
+                         ["qwen2.5vl:3b", "moondream"])
+        self.assertTrue(all(c["keep_alive"] == "5m" for c in vision.calls))
+        self.assertTrue(all(c["options"]["num_predict"] == 1
+                            for c in vision.calls))
+
+    def test_the_vision_warm_does_not_reload_one_model_twice(self):
+        vision = self._vision("qwen2.5vl:3b", "qwen2.5vl:3b")
+        vision.warm()
+        self.assertEqual([c["model"] for c in vision.calls], ["qwen2.5vl:3b"])
+
+    def test_the_vision_warm_skips_a_model_that_is_not_installed(self):
+        vision = self._vision("moondream", "qwen2.5vl:3b")
+        vision._installed = lambda model: model == "moondream"
+        loaded = vision.warm()
+        self.assertEqual(loaded, {"qwen2.5vl:3b": False, "moondream": True})
+
+    def test_the_vision_call_uses_the_configured_keep_alive(self):
+        import numpy as np
+
+        vision = self._vision("moondream", "moondream", keep_alive="42m")
+        out = vision._ask(np.zeros((4, 4, 3), dtype="uint8"), "q")
+        self.assertEqual(vision.calls[0]["keep_alive"], "42m",
+                         "the vision keep_alive was hardcoded to 5m")
+        self.assertEqual(out, "")
+
+    def test_warming_is_a_background_daemon_that_reports_when_done(self):
+        import threading
+        from jarvis.assistant import Assistant
+        from jarvis.config import load_config
+
+        cfg = load_config()
+        cfg.warm_models = True
+        cfg.warm_vision = False
+        assistant = Assistant.__new__(Assistant)
+        assistant.cfg = cfg
+        seen: dict = {}
+        done = threading.Event()
+
+        class _Brain:
+            model = "stub"
+
+            def warm(self_inner):
+                seen["brain"] = True
+                return True
+
+        class _Vision:
+            def warm(self_inner):
+                seen["vision"] = True
+                return {}
+
+        assistant.brain = _Brain()
+        assistant.vision = _Vision()
+
+        def on_done(note):
+            seen["note"] = note
+            done.set()
+
+        thread = Assistant.warm(assistant, on_done=on_done)
+        self.assertIsInstance(thread, threading.Thread)
+        self.assertTrue(thread.daemon, "a warm thread must not keep the process alive")
+        self.assertTrue(done.wait(5), "on_done was never called")
+        self.assertTrue(seen.get("brain"))
+        self.assertNotIn("vision", seen, "vision warming is off by default")
+        self.assertIn("stub loaded", seen["note"])
+
+    def test_warming_can_be_switched_off(self):
+        from jarvis.assistant import Assistant
+        from jarvis.config import load_config
+
+        cfg = load_config()
+        cfg.warm_models = False
+        assistant = Assistant.__new__(Assistant)
+        assistant.cfg = cfg
+        self.assertIsNone(Assistant.warm(assistant))
+
+    def test_warming_vision_runs_after_the_brain_never_beside_it(self):
+        import threading
+        from jarvis.assistant import Assistant
+        from jarvis.config import load_config
+
+        cfg = load_config()
+        cfg.warm_models = True
+        cfg.warm_vision = True
+        assistant = Assistant.__new__(Assistant)
+        assistant.cfg = cfg
+        order: list[str] = []
+        done = threading.Event()
+
+        class _Brain:
+            model = "stub"
+
+            def warm(self_inner):
+                order.append("brain")
+                return True
+
+        class _Vision:
+            def warm(self_inner):
+                order.append("vision")
+                return {"moondream": True}
+
+        assistant.brain = _Brain()
+        assistant.vision = _Vision()
+        Assistant.warm(assistant, on_done=lambda note: done.set())
+        self.assertTrue(done.wait(5))
+        self.assertEqual(order, ["brain", "vision"],
+                         "two ~3 GB loads must not spike memory together")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

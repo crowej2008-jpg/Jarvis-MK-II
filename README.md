@@ -107,6 +107,33 @@ resolving someone else's machine to a literal would change its meaning.
 | `Assistant()` | 4.076s | **0.050s** |
 | Total startup | 7.163s | **1.052s** |
 
+### Warming the model while the room is still quiet
+
+Startup is cheap, but the *first question* is not, and two of its costs have
+nothing to do with the question: loading about 2.4 GB of weights (measured at
+**3.8–6.6s**) and evaluating the system prompt plus the tool schemas (**~3,869
+prompt tokens, ~92s** cold on this CPU). Both are per-session, so `warm_models`
+sends one throwaway request at startup — `[system, "warm-up"]` and the tool
+schemas, `num_predict=1` — and pays them during the idle time before the user
+speaks instead.
+
+It runs on a daemon thread, so startup itself stays ~1s. If the user speaks first
+the turn simply waits on the warmer, which is no slower than loading the model
+inline; if they pause, the load and the prefill are already done. The warm sends
+no history and no fake exchange on purpose: history and the user's text are
+appended *after* the system prompt, and Ollama reuses the longest common prefix,
+so spurious turns at the end would cache nothing a real turn can use.
+
+`warm_vision` is a separate flag and **off by default**. It loads the describe
+model and the pointer, sequenced after the brain rather than beside it so two
+~3 GB loads cannot spike memory together — but it only saves the few seconds of
+model load, because warming cannot cache a screenshot it has never seen and the
+image prefill (68–90s) is the part that hurts. On a 16.8 GB machine that pins
+~4.2 GB for seconds of benefit, so turning it on is a deliberate trade rather
+than a default. `vlm_keep_alive` (default `5m`) controls how long those models
+stay resident; raise it toward `keep_alive` if a first look after a long pause
+matters more than the RAM.
+
 ### Measured speed
 
 The brain prefills at roughly **40 tokens/s** on 10 CPU cores. The system prompt
@@ -477,6 +504,13 @@ silence. Inaudible, and it moves the whole cost off the critical path:
 
 A zero-length write does not prime the driver, which is why the warm-up writes
 real samples of silence.
+
+The live loop prints `(acknowledged in Nms)`, and that number is deliberately not
+the cue latency. `_acknowledge()` runs `play_ack` on a daemon thread and returns,
+so the printed figure is the cost of handing the tone off — sub-millisecond —
+while the number that matters, cue to audible, is the 0.22–2.52ms above. It also
+fires only *after* transcription: the ~1.3s of speech-to-text happens first,
+because a cue before a transcript would be acknowledging the wrong thing.
 
 The stream is process-wide and shared, because TTS and the cue want the same
 output device and two independent `OutputStream`s on one Windows device reliably
@@ -884,7 +918,7 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-389 tests, about 27 seconds, no external network and no model needed. They
+400 tests, about 29 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor
@@ -1183,6 +1217,9 @@ Useful ones:
 | `vlm_timeout` | `300.0` | Seconds before a vision call fails |
 | `request_timeout` | `420.0` | Seconds before a brain call fails |
 | `keep_alive` | `30m` | How long Ollama holds the model and its prompt cache. Costs 3.4 GB while resident; shortening it brings the 92s cold prefill back |
+| `warm_models` | `true` | Load the brain and prefill `[system, tools]` in the background at startup, so the first question does not pay the ~2.4 GB load (3.8–6.6s) and the ~92s cold schema prefill. Non-blocking; the first turn waits on it at worst |
+| `warm_vision` | `false` | Also load the vision models at startup, sequenced after the brain. Off because it pins ~4.2 GB for the few seconds of model load — it cannot cache a screenshot it has never seen, and the image prefill is the part that hurts |
+| `vlm_keep_alive` | `5m` | How long the vision models stay resident after a call. Short by default, because they are the largest thing loaded and the least often used; raise it toward `keep_alive` to make `warm_vision` survive a pause |
 | `keep_last_messages` | `24` | Cap on the replayed message count, independent of the budget below. It is not the window any more — the anchor in `history_char_budget` is. It exists only for a transcript of very short messages, where the character budget alone would not bind. **The most expensive setting here, and it looks free:** a newest-n window slides every turn, the token after the system prompt changes, and the whole history block becomes unreusable. Mean warm prefill: 62.4s at 40, 3.7s at 8, 0.7s at 0. Facts and notes reach the model through the cached system prompt, so the replay only buys anaphora — raise it only with a measurement |
 | `history_char_budget` | `3500` | Character budget for the replayed history. The window is **anchored and append-only**: `growing_window()` persists the oldest replayed message id in `prompt_state`, so the prompt prefix stays byte-identical turn to turn and the model reuses everything but the new exchange. It moves only when this budget is exceeded, then jumps back to `1 - history_trim_slack` of it. Warm prefill 9.78–17.01s → 4.14s, warm turn 19.08s → 12.67s. Capped low because the system prompt and 38 tool schemas are a measured ~4,100 tokens and `num_ctx` is 8,192; at 8,000 chars a tool turn reached 8,181 prompt tokens. `0` replays nothing, which costs all anaphora |
 | `history_trim_slack` | `0.4` | How far below `history_char_budget` a trim drops back to, as a fraction. Swept over 60 turns, counting only the characters re-prefilled *because the anchor moved*: 2,870/turn at 0.0, 835 at 0.25, **406 at 0.4**, 287 at 0.5, 85 at 0.8. 0.4 is the knee — past it the saving flattens while the window a trim leaves behind shrinks from 2,128 to 737 chars, and a short window costs anaphora. At 0.0 the anchor creeps forward one message per turn, which is the sliding window this replaced |

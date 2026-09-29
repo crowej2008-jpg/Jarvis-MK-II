@@ -66,6 +66,24 @@ class Config:
     # answering, which on CPU costs tens of seconds and never reaches the user.
     # Off by default; turn on if you want the reasoning and can wait for it.
     think: bool = False
+    # Load the model and prefill the stable prefix at startup instead of on the
+    # first question. A cold first turn pays the ~2.4 GB model load (3.8-6.6s
+    # here) and the whole 3,869-token system+tool prefill (~92s), neither of
+    # which depends on the question. Warming pays both during idle time, on a
+    # background thread so startup itself stays fast; if the user speaks first
+    # the turn simply waits for the warmer, which is no slower than not warming.
+    warm_models: bool = True
+    # Also load the vision models at startup. This pins about 4.2 GB (2.9 GB
+    # describe + 1.3 GB point) while it lasts, which is a real cost on a 16.8 GB
+    # machine, and it only saves the few seconds of model load: warming cannot
+    # cache a screenshot it has never seen, and the image prefill (68-90s) is the
+    # part that actually hurts. Off by default for that trade; turn it on if the
+    # first look matters more than the RAM.
+    warm_vision: bool = False
+    # How long the vision models stay resident after a call. Short by default,
+    # because they are the largest thing loaded and the least often used; raising
+    # it toward keep_alive is what makes warm_vision pay off across a pause.
+    vlm_keep_alive: str = "5m"
 
     # --- Ears (speech -> text) -------------------------------------------
     stt_model: str = "base.en"

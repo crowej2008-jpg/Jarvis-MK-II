@@ -432,11 +432,49 @@ class Vision:
                 prompt=prompt,
                 images=[payload],
                 options={"temperature": 0.0, "num_predict": cap},
-                keep_alive="5m",
+                keep_alive=getattr(self.cfg, "vlm_keep_alive", "5m"),
             )
         except Exception as exc:  # noqa: BLE001
             raise VLMUnavailable(f"the vision model failed: {exc}") from exc
         return (response.get("response") or "").strip()
+
+    def warm(self) -> dict[str, bool]:
+        """Load the vision models now, so the first look does not wait on disk.
+
+        Warming cannot make the first screenshot cheap: the expensive part is the
+        image prefill (~1,100 image tokens at ~78ms each, 68-90s here), and ollama
+        only caches an image it has already seen. What this removes is the model
+        load itself, 3.8-6.6s per model on this CPU, by paying it during idle
+        time. It sends a single pixel rather than a real screen on purpose: enough
+        to load the weights and the vision projector, and nothing more.
+
+        Both models are warmed when they differ, because pointing and describing
+        are separate installs and the first of either would otherwise pay a load.
+        Returns {model: loaded} so the caller can report what happened.
+        """
+        loaded: dict[str, bool] = {}
+        tiny = np.zeros((8, 8, 3), dtype=np.uint8)
+        payload, _scale, _size = self._prepare(tiny, 8)
+        for model in dict.fromkeys([self.describe_model, self.model]):
+            if not model or model in loaded:
+                continue
+            if not self._installed(model):
+                loaded[model] = False
+                continue
+            try:
+                self._get_client().generate(
+                    model=model,
+                    prompt="warm-up",
+                    images=[payload],
+                    options={"temperature": 0.0, "num_predict": 1},
+                    keep_alive=getattr(self.cfg, "vlm_keep_alive", "5m"),
+                )
+                loaded[model] = True
+                log.info("vision warm: %s loaded", model)
+            except Exception as exc:  # noqa: BLE001
+                loaded[model] = False
+                log.info("vision warm skipped for %s: %s", model, exc)
+        return loaded
 
     # -- capabilities ----------------------------------------------------
     # Moondream answers concrete questions well and rambles when asked to

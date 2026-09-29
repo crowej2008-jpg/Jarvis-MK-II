@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
@@ -233,6 +234,45 @@ class Assistant:
         except Exception as exc:  # noqa: BLE001
             log.warning("vision memory prune failed: %s", exc)
             return {"error": str(exc)}
+
+    def warm(self, on_done: Callable[[str], None] | None = None) -> threading.Thread | None:
+        """Load the models in the background, so the first turn is not the loader.
+
+        Runs on a daemon thread and returns it, so a front end can start
+        listening immediately: the first turn waits on the warmer at worst, which
+        is no slower than paying the load inline, and if the user pauses first
+        the load and the ~92s prefill are already done. Vision warming is off by
+        default because it pins ~4.2 GB and only saves a few seconds; the brain is
+        what a cold first turn is actually dominated by.
+
+        The brain is warmed before the vision models, never at the same time, so
+        the two 3 GB loads cannot spike memory together on a tight machine.
+        """
+        if not getattr(self.cfg, "warm_models", True):
+            return None
+
+        def run() -> None:
+            note = []
+            if self.brain.warm():
+                note.append(f"{self.brain.model} loaded")
+            else:
+                note.append("brain warm skipped")
+            if getattr(self.cfg, "warm_vision", False):
+                loaded = self.vision.warm()
+                ready = [name for name, ok in loaded.items() if ok]
+                note.append(
+                    "vision loaded: " + ", ".join(ready) if ready
+                    else "vision warm skipped"
+                )
+            if on_done:
+                try:
+                    on_done("; ".join(note))
+                except Exception:  # noqa: BLE001
+                    pass
+
+        thread = threading.Thread(target=run, name="jarvis-warm", daemon=True)
+        thread.start()
+        return thread
 
     def describe_tools(self) -> str:
         return ", ".join(self.tool_names())

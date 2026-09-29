@@ -581,6 +581,47 @@ class Brain:
             log.warning("tool specs missing for: %s", ", ".join(missing))
         return specs
 
+    def warm(self) -> bool:
+        """Load the model and prefill the stable prefix before anyone is waiting.
+
+        A cold first turn pays two per-session costs that have nothing to do with
+        the question: loading ~2.4 GB of weights (3.8-6.6s here) and evaluating
+        the system prompt plus the tool schemas (~3,869 tokens, ~92s cold on this
+        CPU). Warming pays them during idle time, and because the prefix is
+        exactly what a real turn starts with, ollama keeps it cached and the
+        first question only pays its own tail.
+
+        The messages are [system, "warm-up"] and never a fake exchange. History
+        and the user's text are appended after the system prompt, and ollama
+        reuses the longest common prefix, so spurious turns at the end would
+        cache nothing a real turn can use. num_predict=1 stops generation at one
+        token, which is the cheapest way to force the load and the prefill.
+
+        Best-effort: returns False on any failure rather than raising, because a
+        warm-up that cannot run must never stop the assistant from starting.
+        """
+        try:
+            self._client.chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt()},
+                    {"role": "user", "content": "warm-up"},
+                ],
+                tools=self._tools() or None,
+                stream=False,
+                options={
+                    "temperature": 0.0,
+                    "num_ctx": self.cfg.num_ctx,
+                    "num_predict": 1,
+                },
+                keep_alive=self.cfg.keep_alive,
+            )
+            log.info("brain warm: %s loaded and prefilled", self.model)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.info("brain warm skipped: %s", exc)
+            return False
+
     def _learn_tools(self, result: Any) -> int:
         """Absorb tools named by a list_more_tools result."""
         if not isinstance(result, dict):

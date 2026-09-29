@@ -130,6 +130,11 @@ def _run(cfg, prompt: str, text_mode: bool, force_voice: bool, no_speak: bool) -
     assistant = Assistant(cfg, memory, brain, speaker)
     assistant.maintain()
     print(f"  vision: {assistant.vision_status()}", file=sys.stderr)
+    # Load the model and prefill the stable prefix in the background. A cold
+    # first turn otherwise pays ~2.4 GB of weights plus ~92s of tool-schema
+    # prefill, and neither depends on the question. Backgrounded so startup
+    # itself stays about a second; the first turn waits on it at worst.
+    assistant.warm(on_done=lambda note: print(f"  warm: {note}", file=sys.stderr))
 
     # Everything past this point can raise or be interrupted, and the visual
     # memory holds an open SQLite connection that should not be leaked.
