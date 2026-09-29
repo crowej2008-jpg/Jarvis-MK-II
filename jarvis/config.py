@@ -234,11 +234,30 @@ class Config:
     # region shifted by 37 levels, so 0.25% sits in a wide gap.
     #
     # Reuse still requires OCR to have read exactly the same words, so this
-    # only has to catch a change too small to alter a single word. Where OCR
-    # found nothing, the bound is tightened to zero instead. Set 0 to force
-    # near-exact matches, or a negative value to disable near hits entirely and
-    # keep only the exact-bytes cache.
+    # only has to catch a change too small to alter a single word. Set 0 to
+    # force near-exact matches, or a negative value to disable near hits
+    # entirely and keep only the exact-bytes cache.
     vlm_describe_reuse_max_changed: float = 0.0025
+
+    # The same bound for screens OCR could not read at all, where there is no
+    # word agreement to lean on and this number is the only gate. It used to be
+    # zero, which meant the reuse tier could never fire on exactly the screens
+    # most likely to be asked about twice - a video, an image, a game.
+    #
+    # Calibrated on the real screen, not chosen. Six untouched captures six
+    # seconds apart differ by *0.0000%* of the 64x64 signature above the
+    # 24-level noise floor, while the mildest genuinely different screens, made
+    # by applying real changes to a real capture, measure:
+    #
+    #   spinner arms moved     0.2686%
+    #   text scrolled a line   2.6367%
+    #   focus ring drawn       2.7832%
+    #   picture swapped        43.7500%
+    #
+    # 0.1% keeps an order of magnitude of clearance below the mildest real
+    # change, and is deliberately tighter than the 0.25% above because OCR is
+    # doing half the work there. Set 0 to require a pixel-exact match.
+    vlm_reuse_max_changed_no_ocr: float = 0.001
 
     # --- Mouse and actuation --------------------------------------------
     # Pixels per second for a full-screen traverse; higher is faster.

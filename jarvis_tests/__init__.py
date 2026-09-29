@@ -2076,6 +2076,13 @@ class TestVlmDescribeFailsFast(unittest.TestCase):
                 self.describe_budget = 150.0
                 self._describe_cache = OrderedDict()
                 self._describe_cache_max = 24
+                # The no-question path reads the reuse tier's bounds, so a stub
+                # that skipped them broke on the pass sequence rather than on
+                # anything this test is about.
+                self._describe_near = OrderedDict()
+                self._describe_reuse_max_changed = -1
+                self._reuse_max_changed_no_ocr = 0.001
+                self._SIGNATURE_DELTA = 24
 
             def _ask(self, image, prompt, model="", max_side=None, num_predict=None):
                 asked.append(prompt)
@@ -2099,6 +2106,10 @@ class TestVlmDescribeFailsFast(unittest.TestCase):
                 self.describe_budget = 150.0
                 self._describe_cache = OrderedDict()
                 self._describe_cache_max = 24
+                self._describe_near = OrderedDict()
+                self._describe_reuse_max_changed = -1
+                self._reuse_max_changed_no_ocr = 0.001
+                self._SIGNATURE_DELTA = 24
 
             def _ask(self, image, prompt, model="", max_side=None, num_predict=None):
                 return f"answer for {prompt[:12]}"
@@ -2125,6 +2136,9 @@ class TestVlmDescribeFailsFast(unittest.TestCase):
                 # about the pass sequence, not about reuse.
                 self._describe_near = OrderedDict()
                 self._describe_reuse_max_changed = -1
+                # describe()'s no-question path reads this too, now that the
+                # blank-OCR tier is calibrated rather than closed.
+                self._reuse_max_changed_no_ocr = 0.001
                 self._SIGNATURE_DELTA = 24
 
             def _ask(self, image, prompt, model="", max_side=None, num_predict=None):
@@ -4881,7 +4895,8 @@ class TestVlmDescribeCache(unittest.TestCase):
     to the server, and a changed screen is correctly a miss.
     """
 
-    def _vision(self, entries=24, answer="A terminal window.", reuse=0.0025):
+    def _vision(self, entries=24, answer="A terminal window.", reuse=0.0025,
+                reuse_no_ocr=0.001):
         from jarvis.vlm import Vision
 
         class Cfg:
@@ -4896,6 +4911,7 @@ class TestVlmDescribeCache(unittest.TestCase):
             vlm_describe_budget_seconds = 150.0
             vlm_describe_cache_entries = entries
             vlm_describe_reuse_max_changed = reuse
+            vlm_reuse_max_changed_no_ocr = reuse_no_ocr
 
         v = Vision(Cfg())
         self.asked: list[str] = []
@@ -5097,19 +5113,85 @@ class TestVlmDescribeCache(unittest.TestCase):
         v.describe(second, ocr_text=rich)
         self.assertEqual(len(self.asked), 2, "a different window reused the description")
 
-    def test_reuse_needs_ocr_agreement_when_there_is_no_text(self):
+    def test_reuse_is_tighter_when_there_is_no_text_to_agree_with(self):
         # This path is reached precisely because OCR had nothing usable to say,
-        # so there is no corroboration and the bar is near-exact instead of
-        # merely close.
+        # so there is no corroboration and the bound is the calibrated 0.1%
+        # rather than the 0.25% OCR agreement earns. A change of ~0.7% is
+        # therefore refused here even though the same change would be reused
+        # with OCR text to corroborate it.
         v = self._vision()
-        quiet = np.full((400, 600, 3), 30, np.uint8)
+        # 64x64 so the signature resize is the identity, and a change of exactly
+        # N pixels is exactly N/4096 of it. Seven pixels is 0.171%, which the
+        # OCR-gated 0.25% would allow and the blank-gated 0.1% must not.
+        quiet = np.full((64, 64, 3), 30, np.uint8)
         nudged = quiet.copy()
-        nudged[200:260, 300:460] = 34  # ~0.7% of pixels, well inside the loose bound
+        nudged[0, :7] = 250  # full contrast, above the 24-level noise floor
+        self.assertAlmostEqual(
+            v._changed_fraction(v._signature(quiet), v._signature(nudged)),
+            7 / 4096, places=4,
+        )
         a = v.describe(quiet)
         b = v.describe(nudged)
         self.assertNotEqual(a, b, "reused with no OCR to agree with")
         # The multi-question path, so three prompts each.
         self.assertEqual(len(self.asked), 6, f"asked {len(self.asked)} times")
+
+    def test_the_same_change_is_reused_when_ocr_agrees(self):
+        # The counterpart, so the tighter blank bound is the only difference: the
+        # identical 0.171% change is reused when OCR read the same words, which
+        # is what corroboration is worth.
+        v = self._vision()
+        rich = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        quiet = np.full((64, 64, 3), 30, np.uint8)
+        nudged = quiet.copy()
+        nudged[0, :7] = 250
+        a = v.describe(quiet, ocr_text=rich)
+        b = v.describe(nudged, ocr_text=rich)
+        self.assertEqual(a, b)
+        self.assertEqual(len(self.asked), 1, f"asked {len(self.asked)} times")
+
+    def test_a_blank_screen_within_the_tight_bound_is_reused(self):
+        # The gap item 2 closed. With OCR blank the bound used to be exactly
+        # zero, which on a live desktop never fires, so the screens most likely
+        # to be asked about twice - a video, an image, a game - paid 71-91s
+        # every time. Live churn measures 0.0000% above the noise floor, so a
+        # non-zero bound is safe here.
+        v = self._vision()
+        quiet = np.full((64, 64, 3), 30, np.uint8)
+        blink = quiet.copy()
+        blink[0, :2] = 250  # a cursor: 0.049%, above the noise floor
+        a = v.describe(quiet)
+        b = v.describe(blink)
+        self.assertEqual(a, b, "a cursor blink forced an 85s re-describe")
+        self.assertEqual(len(self.asked), 3, f"asked {len(self.asked)} times")
+
+    def test_a_blank_screen_real_change_is_not_reused(self):
+        # The other half of the same gate: a real change on a screen with no
+        # text must still miss. The mildest real change measured was a spinner
+        # at 0.2686%, so 0.1% has clearance but is not so loose as to allow it.
+        v = self._vision()
+        quiet = np.full((400, 600, 3), 30, np.uint8)
+        moved = quiet.copy()
+        rng = np.random.default_rng(3)
+        moved[100:200, 100:260] = rng.integers(0, 255, (100, 160, 3), dtype=np.uint8)
+        a = v.describe(quiet)
+        b = v.describe(moved)
+        self.assertNotEqual(a, b, "a genuinely different blank screen reused")
+        self.assertEqual(len(self.asked), 6, f"asked {len(self.asked)} times")
+
+    def test_the_blank_bound_can_be_closed_if_wanted(self):
+        # 0 restores the old pixel-exact behaviour without touching the OCR tier.
+        v = self._vision(reuse_no_ocr=0.0)
+        quiet = np.full((64, 64, 3), 30, np.uint8)
+        # Two pixels, 0.049%, which the 0.1% default allows and zero does not.
+        blink = quiet.copy()
+        blink[0, :2] = 250
+        v.describe(quiet)
+        v.describe(blink)
+        self.assertEqual(len(self.asked), 6, "reuse ran with the blank bound at zero")
 
     def test_the_loose_tier_can_be_switched_off(self):
         # Leave only the exact-bytes cache, for anyone who would rather pay the

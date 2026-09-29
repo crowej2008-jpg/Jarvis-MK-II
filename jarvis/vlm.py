@@ -165,6 +165,29 @@ class Vision:
         # edit to any text is not mistaken for jitter.
         self._SIGNATURE_DELTA = 24
 
+        # The bound for screens OCR could not read at all. With no OCR there is
+        # no corroboration, so this carries the whole decision and has to be
+        # tight - but not exactly zero, because exact equality never fires on a
+        # live desktop and a bound of zero is the same as having no reuse tier.
+        #
+        # Calibrated on the real screen rather than chosen. Six captures six
+        # seconds apart, untouched, measure *0.0000%* of the signature above the
+        # 24-level noise floor: the cursor and the clock redraw far below it.
+        # The mildest genuinely different screens, measured by applying real
+        # changes to a real capture, are:
+        #
+        #   spinner arms moved     0.2686%
+        #   text scrolled a line   2.6367%
+        #   focus ring drawn       2.7832%
+        #   picture swapped        43.7500%
+        #
+        # So 0.1% sits with an order of magnitude of clearance below the mildest
+        # real change while still being non-zero. It is deliberately below the
+        # 0.25% used when OCR agrees, because there OCR is doing half the work.
+        self._reuse_max_changed_no_ocr = float(
+            getattr(cfg, "vlm_reuse_max_changed_no_ocr", 0.001) or 0.0
+        )
+
     def _image_key(self, image: np.ndarray, question: str, model: str) -> str:
         """A cache key over the exact bytes the model would be sent.
 
@@ -221,9 +244,17 @@ class Vision:
         reordering, respacing or an OCR wobble on one glyph does not force an
         85s re-describe, while any word actually appearing or disappearing
         does.
+
+        The question is digested rather than embedded, because `_DETAIL_PROMPTS`
+        are joined with "|" into the multi-question key, and a key that carries
+        raw text cannot be split back apart reliably. That was not theoretical:
+        the blank-OCR bound was read from the last "|" segment, so a prompt
+        containing a pipe looked like OCR corroboration and the tighter bound
+        never applied.
         """
         words = " ".join(sorted(self.content_words(ocr_text)))
-        return f"{model}|{question.strip()}|{words}"
+        qdigest = hashlib.sha256(question.strip().encode("utf-8")).hexdigest()[:16]
+        return f"{model}|{qdigest}|{words}"
 
     def _near_hit(
         self, near_key: str, signature: np.ndarray
@@ -235,18 +266,23 @@ class Vision:
         dragging, a scrollbar thumb, an image swapping in place.
 
         Where OCR found nothing to agree about, there is no corroboration to
-        lean on, so the bar is raised to requiring a near-exact match rather
-        than merely a close one. A screen we could not read at all is exactly
-        the screen where a confident wrong reuse is least defensible.
+        lean on, so the bar drops to the tighter `_reuse_max_changed_no_ocr`
+        instead of the bound OCR agreement earns. A screen we could not read at
+        all is exactly the screen where a confident wrong reuse is least
+        defensible, so it is not switched off - the bound is simply calibrated
+        for a lone gatekeeper, and measured to have an order of magnitude of
+        clearance below the mildest real change.
         """
         stored = [entry for key, entry in self._describe_near.items()
                   if key == near_key]
         if not stored:
             return "", False, 1.0
-        # The tail after the final "|" is the OCR word set. Empty means OCR gave
-        # us nothing to agree with, so the bar drops to an exact signature match.
+        # The tail after the final "|" is the OCR word set, which is empty only
+        # when OCR found nothing. The question is a digest, so it can never
+        # contribute a segment of its own here.
         ocr_words = near_key.rsplit("|", 1)[-1]
-        limit = self._describe_reuse_max_changed if ocr_words else 0.0
+        limit = (self._describe_reuse_max_changed if ocr_words
+                 else self._reuse_max_changed_no_ocr)
         # Closest stored signature wins, so the reused answer comes from the
         # most similar screen we have actually seen rather than the first
         # acceptable one.
@@ -489,14 +525,21 @@ class Vision:
                 return ""
             return answer if self._usable(answer) else ""
 
-        # The loose tier is deliberately not used here. This path is reached
-        # precisely because OCR had nothing usable to say, so there is no
-        # corroboration to require agreement with, and reuse would rest on the
-        # pixel bound alone. Missing on purpose, not an oversight.
+        # This path is reached precisely because OCR had nothing usable to say,
+        # so there is no corroboration to require agreement with and the reuse
+        # tier rests on the pixel bound alone. That bound is now calibrated
+        # rather than absent: _reuse_max_changed_no_ocr is 0.1%, against a
+        # measured 0.0000% for live churn and 0.2686% for the mildest real
+        # change, so the gate is tight but not closed.
         key = self._image_key(image, "|".join(self._DETAIL_PROMPTS),
                               self.describe_model)
         answer, _hit = self._describe_cached(
-            key, lambda: self._multi_pass(image, deadline)
+            key,
+            lambda: self._multi_pass(image, deadline),
+            near_key=self._near_key(
+                "|".join(self._DETAIL_PROMPTS), self.describe_model, ""
+            ),
+            signature=self._signature(image),
         )
         return answer
 
