@@ -1322,6 +1322,9 @@ def _prompt_brain():
         keep_last_messages = 6
         max_tool_rounds = 6
         tool_select_max = 0
+        # Mirrors the real default. Absent it, think() would raise rather than
+        # take the path the other prompt tests here have always taken.
+        fast_path = True
 
     brain = Brain.__new__(Brain)
     brain.cfg = _Cfg()
@@ -4075,6 +4078,567 @@ class TestMultiMonitorGeometry(unittest.TestCase):
         # second monitor to 2880x1620 in mss.
         self.assertNotEqual(env.DPI_AWARENESS, "system")
         self.assertIn(env.DPI_AWARENESS, ("per-monitor-v2", "per-monitor", "none"))
+
+
+class TestFastPathGate(unittest.TestCase):
+    """The gate that decides a question needs no tools at all.
+
+    It exists because the 38-tool schema is most of the prompt, and a warm turn
+    with it attached took 103s to first output against 0.33s without. The cost of
+    getting it wrong is asymmetric: a slow correct answer is fine, a fast wrong
+    one is not. So every one of these tests is about leaning towards the tools.
+    """
+
+    def test_a_plain_question_needs_no_tools(self):
+        from jarvis.brain import needs_tools
+
+        for question in (
+            "what is the capital of france",
+            "how do i bake sourdough bread",
+            "why is the sky blue",
+            "hello there",
+            "thanks, that was helpful",
+            "2 + 2",
+            "tell me a joke",
+            "summarise what we decided about the budget",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(needs_tools(question))
+
+    def test_anything_naming_a_tool_thing_needs_a_tool(self):
+        from jarvis.brain import needs_tools
+
+        for question in (
+            "take a screenshot of the screen",
+            "turn off the lights",
+            "what do you remember about my wifi",
+            "shut down the computer",
+            "what is the weather in paris",
+            "copy that to the clipboard",
+            "read the file report.docx",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(needs_tools(question))
+
+    def test_an_imperative_needs_a_tool_even_with_no_tag_word(self):
+        # The gap that made the tag vocabulary unsafe on its own. Not one of
+        # these appears in any TOOL_TAGS entry, and all of them are obvious tool
+        # calls: a bare verb that only makes sense if something is done.
+        from jarvis.brain import needs_tools
+
+        for question in (
+            "open notepad",
+            "launch the browser",
+            "install firefox",
+            "find my keys",
+            "send an email to sam",
+            "play the next track",
+            "record a note",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(needs_tools(question))
+
+    def test_the_verb_check_does_not_fire_on_substrings(self):
+        # Substring matching would make "opening hours" an imperative and
+        # "running water" a request to execute something.
+        from jarvis.brain import needs_tools
+
+        self.assertFalse(needs_tools("what are the opening hours"))
+        self.assertFalse(needs_tools("explain running water erosion"))
+
+    def test_politeness_does_not_force_the_slow_path(self):
+        # These appear in almost every request. Blocking on them would put
+        # nearly all traffic on the slow path and the fast path would never run.
+        from jarvis.brain import needs_tools
+
+        for question in (
+            "can you explain gravity",
+            "could you tell me about roman empire",
+            "please explain photosynthesis",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(needs_tools(question))
+
+    def test_an_empty_request_is_not_treated_as_simple(self):
+        from jarvis.brain import needs_tools
+
+        self.assertTrue(needs_tools(""))
+        self.assertTrue(needs_tools("   "))
+
+    def test_a_refusal_is_recognised_so_the_slow_call_can_happen(self):
+        from jarvis.brain import fast_path_refused
+
+        for text in (
+            "I don't have access to your calendar.",
+            "I can't do that without a tool.",
+            "I'm unable to open applications.",
+            "You would need to use the open_app tool.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(fast_path_refused(text))
+
+    def test_a_normal_answer_is_not_mistaken_for_a_refusal(self):
+        # The dangerous direction here is a false positive: this would throw away
+        # a perfectly good fast answer and pay the slow call for nothing.
+        from jarvis.brain import fast_path_refused
+
+        for text in (
+            "The capital of France is Paris.",
+            "You can find the file under your documents folder.",
+            "I can tell you about gravity, though I cannot see your screen.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(fast_path_refused(text))
+
+
+class TestFastPathRouting(unittest.TestCase):
+    """A no-tools question must skip the schema block, and a bad guess must
+    be recoverable rather than returned to the user."""
+
+    def _brain(self, replies):
+        """A Brain whose model returns `replies` in order.
+
+        Each entry is (text, tool_calls). Tools are recorded per call so a test
+        can assert what the model was actually offered.
+        """
+        from jarvis.brain import Brain
+        from jarvis.config import load_config
+
+        cfg = load_config()
+        cfg.fast_path = True
+        brain = Brain.__new__(Brain)
+        brain.cfg = cfg
+        brain._extra_tools = set()
+        brain._ensure_registry = lambda: None
+        brain.model = "stub"
+        brain.memory = _FastPathMemory()
+        brain.on_thinking = None
+        brain._pending = list(replies)
+        brain.calls = []
+
+        def fake_round(messages, tools, on_token):
+            brain.calls.append(list(tools or []))
+            return brain._pending.pop(0)
+
+        brain._round = fake_round
+        brain._tools = lambda user_text=None: [{"function": {"name": "open_app"}}]
+        brain._messages = lambda user_text, images: [{"role": "user", "content": user_text}]
+        return brain
+
+    def test_a_simple_question_is_answered_with_no_tools_sent(self):
+        from jarvis.brain import Brain
+
+        brain = self._brain([("The capital of France is Paris.", None)])
+        brain.preroute = lambda user_text: None
+        brain.supports_images = lambda: False
+        reply = Brain.think(brain, "what is the capital of france")
+        self.assertEqual(reply.text, "The capital of France is Paris.")
+        self.assertEqual(len(brain.calls), 1, "should not have needed a second call")
+        self.assertEqual(brain.calls[0], [], "the tool block was still sent")
+
+    def test_a_tool_ish_question_goes_straight_to_the_tools(self):
+        from jarvis.brain import Brain
+
+        # The stub answers in text rather than emitting a real tool call. This
+        # test is about what the model is offered, and a genuine call would
+        # launch Notepad on the machine running the tests.
+        brain = self._brain([("Opening Notepad.", None)])
+        brain.preroute = lambda user_text: None
+        brain.supports_images = lambda: False
+        Brain.think(brain, "open notepad")
+        self.assertEqual(len(brain.calls), 1)
+        self.assertTrue(brain.calls[0], "no tools were offered for a tool request")
+
+    def test_a_refusal_gets_retried_with_tools_instead_of_returned(self):
+        # The safety net. If the gate guesses wrong, the user gets the real
+        # answer rather than "I can't do that".
+        from jarvis.brain import Brain
+
+        brain = self._brain([
+            ("I don't have access to that.", None),
+            ("Notepad is open.", None),
+        ])
+        brain.preroute = lambda user_text: None
+        brain.supports_images = lambda: False
+        reply = Brain.think(brain, "what is the capital of france")
+        self.assertEqual(reply.text, "Notepad is open.")
+        self.assertEqual(len(brain.calls), 2, "the slow retry never happened")
+        self.assertEqual(brain.calls[0], [], "first call should have had no tools")
+        self.assertTrue(brain.calls[1], "retry should have had the tools")
+
+    def test_the_fast_path_can_be_switched_off(self):
+        from jarvis.brain import Brain
+
+        brain = self._brain([("Paris.", None)])
+        brain.cfg.fast_path = False
+        brain.preroute = lambda user_text: None
+        brain.supports_images = lambda: False
+        Brain.think(brain, "what is the capital of france")
+        self.assertTrue(brain.calls[0], "fast_path=False still skipped the tools")
+
+    def test_an_attached_image_always_takes_the_slow_path(self):
+        # The model can read an image with no tools, but the follow-up almost
+        # always needs one, and the vision call is slow enough that guessing is
+        # not worth it.
+        from jarvis.brain import Brain
+
+        brain = self._brain([("There is a button.", None)])
+        brain.preroute = lambda user_text: None
+        brain.supports_images = lambda: True
+        Brain.think(brain, "what is this", images=["shot.png"])
+        self.assertTrue(brain.calls[0], "an image skipped the tool block")
+
+
+class TestAcknowledgeCue(unittest.TestCase):
+    """The 'I heard you' cue, and the claim that it can beat 50ms."""
+
+    def test_a_known_tone_is_a_short_quiet_wave(self):
+        from jarvis.audio import ack_tone
+
+        wave = ack_tone("tick")
+        self.assertIsNotNone(wave)
+        self.assertEqual(wave.dtype.name, "float32")
+        # Under 100ms. A cue the user has to wait for is just a delay.
+        self.assertLess(len(wave) / 16000, 0.1)
+        self.assertLessEqual(float(abs(wave).max()), 0.3, "too loud for a cue")
+        # Starts and ends at zero, so it cannot click.
+        self.assertLess(abs(float(wave[0])), 1e-3)
+        self.assertLess(abs(float(wave[-1])), 1e-3)
+
+    def test_the_tone_actually_oscillates(self):
+        # Guards against a window of silence passing as a tone.
+        from jarvis.audio import ack_tone
+
+        wave = ack_tone("chime")
+        crossings = sum(
+            1 for i in range(1, len(wave))
+            if (wave[i - 1] < 0) != (wave[i] < 0)
+        )
+        self.assertGreater(crossings, 4)
+
+    def test_an_unknown_or_empty_name_gives_no_wave(self):
+        from jarvis.audio import ack_tone
+
+        self.assertIsNone(ack_tone("nonsense"))
+        self.assertIsNone(ack_tone(""))
+        # No stream should be opened to play nothing.
+        import jarvis.audio as audio
+
+        saved = (audio._ACK_STREAM, audio._ACK_STREAM_DEAD)
+        audio._ACK_STREAM, audio._ACK_STREAM_DEAD = None, True
+        try:
+            self.assertFalse(audio.play_ack("nonsense"))
+        finally:
+            audio._ACK_STREAM, audio._ACK_STREAM_DEAD = saved
+
+    def test_names_are_forgiving_about_case_and_padding(self):
+        from jarvis.audio import ack_tone
+
+        for name in ("TICK", "  tick  ", "Tick"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(ack_tone(name))
+
+    def test_the_cue_is_queued_not_blocking(self):
+        # Writing to a running stream returns immediately. A blocking call here
+        # would put the cue's duration in front of the model call.
+        import inspect
+
+        from jarvis import audio
+
+        source = inspect.getsource(audio.play_ack)
+        self.assertNotIn("blocking=True", source)
+        self.assertNotIn("sd.wait()", source)
+        self.assertIn("stream.write(", source)
+
+    def test_the_output_stream_is_opened_before_anything_is_waiting(self):
+        # Opening an OutputStream costs ~200ms here and the first write costs
+        # another ~220ms while the driver primes. Paying either at reply time
+        # would make the cue slower than the answer it is covering, so the
+        # stream is opened while idle.
+        import inspect
+
+        from jarvis import audio
+
+        self.assertIn("warm_ack_stream", dir(audio))
+        self.assertIn("OutputStream", inspect.getsource(audio.warm_ack_stream))
+
+    def test_warming_primes_the_driver_with_silence(self):
+        # Opening the stream is not sufficient. The first write to a fresh
+        # stream costs ~220ms while the driver primes, and a zero-length write
+        # does not trigger it, so the prime has to be real samples. Measured:
+        # warming with 20ms of zeros took 10.4ms here, and the first cue
+        # afterwards wrote in 0.44ms instead of 223.11ms.
+        import inspect
+
+        import numpy as np
+
+        from jarvis import audio
+
+        source = inspect.getsource(audio.warm_ack_stream)
+        self.assertIn("stream.write(", source, "the stream is never primed")
+
+        written = []
+
+        class FakeStream:
+            def start(self):
+                pass
+
+            def write(self, buf):
+                written.append(np.asarray(buf))
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        import sounddevice as sd
+
+        real = sd.OutputStream
+        sd.OutputStream = lambda **kw: FakeStream()
+        audio._ACK_STREAM, audio._ACK_STREAM_DEAD = None, False
+        try:
+            self.assertTrue(audio.warm_ack_stream())
+            self.assertEqual(len(written), 1, "warm_ack_stream wrote nothing")
+            prime = written[0]
+            self.assertGreater(len(prime), 0, "an empty write does not prime the driver")
+            self.assertTrue(
+                not prime.any(), "the prime must be silence, not a tone"
+            )
+        finally:
+            audio.close_ack_stream()
+            sd.OutputStream = real
+            audio._ACK_STREAM, audio._ACK_STREAM_DEAD = None, False
+
+    def test_warming_the_stream_happens_once_and_latches_failure(self):
+        from jarvis import audio
+
+        opened = []
+
+        class FakeStream:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+            def write(self, buf):
+                pass
+
+        import sounddevice as sd
+
+        real = sd.OutputStream
+        sd.OutputStream = lambda **kw: (opened.append(kw), FakeStream())[1]
+        audio._ACK_STREAM = None
+        audio._ACK_STREAM_DEAD = False
+        try:
+            self.assertTrue(audio.warm_ack_stream())
+            self.assertTrue(audio.warm_ack_stream(), "warmed twice")
+            self.assertEqual(len(opened), 1, "the device was opened more than once")
+        finally:
+            audio.close_ack_stream()
+            sd.OutputStream = real
+            audio._ACK_STREAM = None
+            audio._ACK_STREAM_DEAD = False
+
+    def test_a_missing_output_device_is_remembered_not_retried_forever(self):
+        # Without the latch, every turn would pay another failed device open.
+        from jarvis import audio
+
+        import sounddevice as sd
+
+        real = sd.OutputStream
+        attempts = []
+
+        def boom(**kw):
+            attempts.append(kw)
+            raise RuntimeError("no output device")
+
+        sd.OutputStream = boom
+        audio._ACK_STREAM = None
+        audio._ACK_STREAM_DEAD = False
+        try:
+            audio.play_ack("tick")
+            audio.play_ack("tick")
+            self.assertLessEqual(
+                len(attempts), 1,
+                f"tried to open a dead device {len(attempts)} times",
+            )
+            self.assertTrue(audio._ACK_STREAM_DEAD)
+        finally:
+            sd.OutputStream = real
+            audio._ACK_STREAM = None
+            audio._ACK_STREAM_DEAD = False
+
+    def test_writing_to_the_cue_stream_does_not_block_on_playback(self):
+        # The measured claim: with the stream already open, the write returns in
+        # well under a millisecond even though the sound plays afterwards.
+        from jarvis import audio
+
+        written = []
+
+        class FakeStream:
+            def start(self):
+                pass
+
+            def write(self, buf):
+                written.append(len(buf))
+
+        import sounddevice as sd
+
+        real = sd.OutputStream
+        sd.OutputStream = lambda **kw: FakeStream()
+        audio._ACK_STREAM = None
+        audio._ACK_STREAM_DEAD = False
+        try:
+            start = time.perf_counter()
+            self.assertTrue(audio.play_ack("tick"))
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            self.assertEqual(len(written), 1)
+            self.assertLess(elapsed_ms, 50, f"cue took {elapsed_ms:.0f}ms to queue")
+        finally:
+            audio._ACK_STREAM = None
+            audio._ACK_STREAM_DEAD = False
+            sd.OutputStream = real
+
+    def test_the_cue_cannot_take_down_a_turn(self):
+        # No output device, a broken driver, a held device: none of that may
+        # stop the answer, which is the part the user actually came for.
+        import jarvis.audio as audio
+
+        real = audio.ack_tone
+        audio.ack_tone = lambda name, rate=16000: (_ for _ in ()).throw(
+            RuntimeError("no output device")
+        )
+        saved = (audio._ACK_STREAM, audio._ACK_STREAM_DEAD)
+        audio._ACK_STREAM, audio._ACK_STREAM_DEAD = None, False
+        try:
+            self.assertFalse(audio.play_ack("tick"))
+        finally:
+            audio.ack_tone = real
+            audio._ACK_STREAM, audio._ACK_STREAM_DEAD = saved
+
+    def test_the_stream_is_shared_not_reopened_per_cue(self):
+        # TTS and the cue share one output device. Two independent
+        # OutputStreams on a Windows output device is a reliable way to get
+        # exclusive-mode errors, so play_ack reuses one process-wide stream.
+        import jarvis.audio as audio
+
+        streams = []
+
+        class FakeStream:
+            def start(self):
+                pass
+
+            def write(self, buf):
+                streams.append(("write", len(buf)))
+
+            def stop(self):
+                streams.append(("stop", 0))
+
+            def close(self):
+                streams.append(("close", 0))
+
+        import sounddevice as sd
+
+        real = sd.OutputStream
+        created = []
+
+        def factory(**kw):
+            created.append(kw)
+            return FakeStream()
+
+        sd.OutputStream = factory
+        audio._ACK_STREAM, audio._ACK_STREAM_DEAD = None, False
+        try:
+            audio.play_ack("tick")
+            audio.play_ack("chime")
+            audio.play_ack("tick")
+            self.assertEqual(len(created), 1, f"opened {len(created)} output streams")
+            self.assertEqual(len([s for s in streams if s[0] == "write"]), 3)
+        finally:
+            audio.close_ack_stream()
+            sd.OutputStream = real
+            audio._ACK_STREAM, audio._ACK_STREAM_DEAD = None, False
+
+    def test_turns_emit_the_cue_before_the_model_is_called(self):
+        # Ordering is the feature. A cue after respond() is pointless, since by
+        # then there is an answer to hear.
+        import inspect
+
+        from jarvis.voice import VoiceLoop
+
+        source = inspect.getsource(VoiceLoop._run_turn)
+        self.assertLess(
+            source.index("_acknowledge()"),
+            source.index("self.assistant.respond("),
+            "the cue must fire before the model is called",
+        )
+
+    def test_the_cue_is_off_when_configured_empty(self):
+        from jarvis.config import load_config
+        from jarvis.voice import VoiceLoop
+
+        cfg = load_config()
+        cfg.acknowledge_sound = ""
+        loop = VoiceLoop.__new__(VoiceLoop)
+        loop.ack_sound = cfg.acknowledge_sound or ""
+        loop._say = lambda *a, **k: None
+        called = []
+        import jarvis.voice as voice
+
+        real = voice.play_ack
+        voice.play_ack = lambda *a, **k: called.append(a)
+        try:
+            loop._acknowledge()
+            time.sleep(0.05)
+        finally:
+            voice.play_ack = real
+        self.assertEqual(called, [], "an empty setting should produce no sound")
+
+    def test_the_stream_is_warmed_when_the_loop_starts(self):
+        # Without this, the first cue of the session pays the device open and
+        # lands about 400ms after the user stopped talking.
+        import inspect
+
+        from jarvis.voice import VoiceLoop
+
+        source = inspect.getsource(VoiceLoop.run)
+        self.assertIn("warm_ack_stream", source)
+
+    def test_building_the_cue_takes_far_less_than_fifty_milliseconds(self):
+        # The reason the cue can meet the target at all: there is no file to
+        # read and no codec to run.
+        from jarvis.audio import ack_tone
+
+        start = time.perf_counter()
+        for _ in range(20):
+            ack_tone("tick")
+        each_ms = (time.perf_counter() - start) * 1000 / 20
+        self.assertLess(each_ms, 50, f"cue generation cost {each_ms:.1f}ms each")
+
+
+class _FastPathMemory:
+    """Just enough Memory for think() to record a turn.
+
+    Named distinctly from the other stubs here: a module-level _StubMemory
+    already exists further up with a different constructor, and shadowing it
+    breaks unrelated tests.
+    """
+
+    def __init__(self, rows=None):
+        self.rows = []
+        self._rows = list(rows or [])
+
+    def add_message(self, role, text, **kw):
+        self.rows.append((role, text))
+
+    def recent(self, *a, **k):
+        return []
 
 
 if __name__ == "__main__":
