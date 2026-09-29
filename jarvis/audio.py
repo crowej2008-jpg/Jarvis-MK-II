@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from collections import deque
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -320,6 +320,148 @@ class Mic:
         if not chunks:
             raise AudioUnavailable("no audio captured")
         return np.concatenate(chunks).astype(np.float32)
+
+
+# Short cues for "I heard you, I am on it". Each is a couple of cycles of a
+# quiet tone, under about 90ms, and fades in and out so it cannot click.
+#
+# These are generated rather than shipped as audio files on purpose: no asset to
+# lose, no decode step on the critical path, and the prompt owes the user a
+# reaction in tens of milliseconds. Anything with a file read or an mp3 decode in
+# it would be spending that budget on bookkeeping.
+ACK_TONES: dict[str, tuple[float, float, int]] = {
+    # (frequency Hz, seconds, cycles)
+    "tick": (880.0, 0.045, 1),
+    "chime": (660.0, 0.080, 2),
+    "blip": (1046.5, 0.035, 1),
+    "soft": (523.25, 0.060, 1),
+}
+
+
+def ack_tone(name: str, rate: int = 16000) -> np.ndarray | None:
+    """Build a short acknowledgement cue, or None if the name is unknown.
+
+    Returned as float32 in [-1, 1] at `rate`, ready for sounddevice.
+    """
+    spec = ACK_TONES.get((name or "").strip().lower())
+    if not spec:
+        return None
+    freq, seconds, cycles = spec
+    n = max(1, int(rate * seconds))
+    t = np.arange(n, dtype=np.float32) / float(rate)
+    # A Hann window rather than a hard stop: a square-edged buffer of a sine is
+    # mostly ultrasonic click energy, and this is played on someone's speakers.
+    window = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n, dtype=np.float32) / n)
+    wave = np.sin(2.0 * np.pi * freq * cycles * t).astype(np.float32)
+    return (wave * window * 0.18).astype(np.float32)
+
+
+# A sounddevice OutputStream costs ~200ms to open, and a first write costs a
+# further ~220ms while the driver primes. Both are measured on this machine.
+# Since the cue exists to beat 50ms, the stream is opened once and kept, and
+# play_ack() then writes into it for 0.2ms. A cue that pays the open cost at
+# reply time is 200ms late, which is slower than the thing it is meant to cover.
+#
+# Guarded because sd is imported lazily and the stream is process-wide: TTS and
+# the cue share the device, and two independent OutputStreams on one Windows
+# output device is a reliable way to get exclusive-mode errors.
+_ACK_LOCK = threading.Lock()
+_ACK_STREAM: Any = None
+_ACK_STREAM_RATE = 0
+_ACK_STREAM_DEAD = False
+
+
+def warm_ack_stream(rate: int = 16000) -> bool:
+    """Open the cue output stream ahead of time, while nothing is waiting.
+
+    Call this once at startup. It is what makes the first real cue fast: the
+    open and the driver's first-write cost are paid here, during idle time,
+    rather than in the middle of a reply.
+    """
+    global _ACK_STREAM, _ACK_STREAM_RATE, _ACK_STREAM_DEAD
+    with _ACK_LOCK:
+        if _ACK_STREAM is not None or _ACK_STREAM_DEAD:
+            return _ACK_STREAM is not None
+        try:
+            import sounddevice as sd
+
+            stream = sd.OutputStream(samplerate=rate, channels=1, dtype="float32")
+            stream.start()
+            # Open is not enough. The first write to a fresh stream costs
+            # ~220ms while the driver primes, measured here, and that lands on
+            # the first cue of the session. A zero-length write is not enough
+            # either, so prime with real silence: a few ms of zeros, which is
+            # inaudible, and then the first real cue writes in 0.3ms.
+            stream.write(np.zeros(int(rate * 0.02), dtype=np.float32))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not pre-open the cue output: %s", exc)
+            # Latch the failure so a missing device costs one attempt, not one
+            # per turn, forever.
+            _ACK_STREAM_DEAD = True
+            return False
+        _ACK_STREAM = stream
+        _ACK_STREAM_RATE = rate
+        return True
+
+
+def play_ack(name: str, rate: int = 16000) -> bool:
+    """Play an acknowledgement cue. Returns True if a sound was made.
+
+    Best effort by design. A cue is a courtesy, so every failure here is
+    swallowed: a missing output device must never take down the turn that is
+    already in flight. That includes the buffer being built, not just the
+    playback, since a cue is never important enough to be worth a traceback.
+    """
+    global _ACK_STREAM, _ACK_STREAM_DEAD
+    try:
+        wave = ack_tone(name, rate)
+        if wave is None:
+            return False
+
+        import sounddevice as sd
+
+        with _ACK_LOCK:
+            stream = _ACK_STREAM
+            if stream is None and not _ACK_STREAM_DEAD:
+                try:
+                    stream = sd.OutputStream(samplerate=rate, channels=1,
+                                             dtype="float32")
+                    stream.start()
+                    _ACK_STREAM = stream
+                    _ACK_STREAM_RATE = rate
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("cue output unavailable: %s", exc)
+                    _ACK_STREAM_DEAD = True
+                    stream = None
+            if stream is None:
+                # No output device we can hold. There is a deliberate fallback
+                # that is not taken: sd.play() would work, but it opens and
+                # closes its own stream, so it costs the ~200ms this cue exists
+                # to avoid, on every turn, forever. Silence is the better
+                # failure for something that is only a courtesy.
+                return False
+            # copy(): the stream keeps the buffer until it has played it, and
+            # this one is about to go out of scope.
+            stream.write(wave.copy())
+            return True
+    except Exception as exc:  # noqa: BLE001
+        log.debug("acknowledgement tone failed: %s", exc)
+        return False
+
+
+def close_ack_stream() -> None:
+    """Release the cue output stream. Safe to call when there is not one."""
+    global _ACK_STREAM, _ACK_STREAM_RATE
+    with _ACK_LOCK:
+        stream, _ACK_STREAM = _ACK_STREAM, None
+        _ACK_STREAM_RATE = 0
+    if stream is None:
+        return
+    try:
+        stream.stop()
+        stream.close()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("closing the cue output failed: %s", exc)
 
 
 def _finalise(chunks: list[np.ndarray], threshold: float) -> np.ndarray:

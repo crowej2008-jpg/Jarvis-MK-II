@@ -17,7 +17,7 @@ from typing import Any, Callable
 import numpy as np
 
 from .assistant import Assistant
-from .audio import Mic
+from .audio import Mic, play_ack, warm_ack_stream
 from .stt import Listener, Transcript
 from .wake import WakeWord
 
@@ -56,6 +56,9 @@ class VoiceLoop:
         self._stop = threading.Event()
         self._meter: threading.Thread | None = None
         self._tty = sys.stdout.isatty()
+        # Read once at construction: the cue must not be a thing that changes
+        # behaviour halfway through a session.
+        self.ack_sound = getattr(cfg, "acknowledge_sound", "") or ""
 
     # -- console helpers -------------------------------------------------
     def _say(self, text: str = "") -> None:
@@ -152,6 +155,23 @@ class VoiceLoop:
         self._stop_meter()
         return self.listener.transcribe(audio)
 
+    def _acknowledge(self) -> None:
+        """Sound a "I heard you" cue without waiting on the model.
+
+        Runs on its own thread so a slow or contended output device cannot add
+        its startup cost to the turn. The thread is a daemon and the call is
+        fire-and-forget: the answer matters, the cue does not, and by the time
+        this matters the sound is long over.
+        """
+        if not self.ack_sound:
+            return
+        tone = self.ack_sound
+
+        def emit() -> None:
+            play_ack(tone)
+
+        threading.Thread(target=emit, name="jarvis-ack", daemon=True).start()
+
     def _run_turn(self) -> bool:
         """Record, transcribe, answer, speak. Returns False to stop the loop."""
         self._stop_meter()
@@ -177,6 +197,16 @@ class VoiceLoop:
         self._say(f"  ({transcript.elapsed:.1f}s to transcribe)")
         if self.wake:
             self.wake.reset()
+
+        # Acknowledge before thinking, not after. The cue is queued on the
+        # output device and returns immediately, so the wait the user actually
+        # feels starts here rather than at the first token of the answer.
+        #
+        # It fires only once the transcript exists, which means the user is
+        # already sure they were heard, so this is a cue rather than a check.
+        ack_at = time.time()
+        self._acknowledge()
+        self._say(f"  (acknowledged in {(time.time() - ack_at) * 1000:.0f}ms)")
 
         streamed: list[str] = []
         started = time.time()
@@ -214,6 +244,12 @@ class VoiceLoop:
     def run(self, max_turns: int = 0) -> None:
         self.assistant.set_approver(self._confirm)
         self.mic.start()
+        # Open the cue output now, while nothing is waiting on an answer.
+        # Doing it at reply time costs ~200ms to open plus ~220ms for the
+        # driver's first write, which would put the first cue of the session
+        # behind the answer it is meant to precede.
+        if self.ack_sound:
+            warm_ack_stream()
         has_wake = self._install_wake()
 
         self._say("")
