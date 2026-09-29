@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from .config import Config, pick_model
+from .config import Config, connect_host, pick_model
 from .memory import Memory
 from .tools import load_all
 
@@ -494,7 +494,11 @@ class Brain:
 
         import ollama
 
-        self._client = ollama.Client(host=cfg.ollama_host, timeout=cfg.request_timeout)
+        # connect_host, because ollama's own client resolves "localhost" to
+        # ::1 first and gets refused, and the ~2s that costs is paid again on
+        # every reconnect for the rest of the session. See config.connect_host.
+        self._client = ollama.Client(host=connect_host(cfg.ollama_host),
+                                     timeout=cfg.request_timeout)
         self._image_capability: bool | None = None
         # Tools pulled in by list_more_tools, kept for the rest of the session
         # so the model discovers each capability once, not once per turn.

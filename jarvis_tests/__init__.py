@@ -5244,5 +5244,136 @@ class TestVlmDescribeCache(unittest.TestCase):
         )
 
 
+class TestLoopbackHostResolution(unittest.TestCase):
+    """Ollama listens on IPv4 only, so "localhost" costs ~2s to refuse ::1 first.
+
+    Measured on this machine: a socket to ::1:11434 is refused after 2.06s, and
+    127.0.0.1:11434 connects in 0.015s. The app paid that twice per launch, in
+    pick_model and the embedder probe, so 4.1s of a 7.16s startup went to
+    reaching a server 15ms away. These tests pin the rewrite.
+    """
+
+    def test_a_localhost_host_becomes_the_ipv4_literal(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host("http://localhost:11434"),
+                         "http://127.0.0.1:11434")
+
+    def test_the_port_and_path_survive(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host("http://localhost:11434/api"),
+                         "http://127.0.0.1:11434/api")
+
+    def test_a_portless_host_becomes_the_ipv4_literal(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host("http://localhost"), "http://127.0.0.1")
+
+    def test_a_https_localhost_keeps_its_scheme(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host("https://localhost:443"),
+                         "https://127.0.0.1:443")
+
+    def test_a_case_variant_is_still_recognised(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host("http://LocalHost:11434"),
+                         "http://127.0.0.1:11434")
+
+    def test_a_trailing_slash_is_handled(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host("http://localhost:11434/"),
+                         "http://127.0.0.1:11434")
+
+    def test_a_remote_host_is_left_exactly_as_written(self):
+        from jarvis.config import connect_host
+
+        # Someone else's machine must keep their own name, because a name
+        # resolved to a literal is a change of meaning, not a speed-up.
+        for host in ("http://ollama.lan:11434", "http://192.168.1.50:11434",
+                     "https://api.example.com"):
+            self.assertEqual(connect_host(host), host)
+
+    def test_an_already_resolved_host_is_untouched(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host("http://127.0.0.1:11434"),
+                         "http://127.0.0.1:11434")
+
+    def test_a_host_with_no_scheme_is_still_rewritten(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host("localhost:11434"), "127.0.0.1:11434")
+
+    def test_an_empty_host_does_not_explode(self):
+        from jarvis.config import connect_host
+
+        self.assertEqual(connect_host(""), "")
+
+    def test_the_embedder_dials_the_ipv4_literal(self):
+        from jarvis.embeddings import OllamaEmbedder
+
+        emb = OllamaEmbedder("http://localhost:11434", "nomic-embed-text")
+        self.assertEqual(emb.host, "http://127.0.0.1:11434")
+
+    def test_the_embedder_keeps_a_remote_host(self):
+        from jarvis.embeddings import OllamaEmbedder
+
+        emb = OllamaEmbedder("http://ollama.lan:11434/", "nomic-embed-text")
+        self.assertEqual(emb.host, "http://ollama.lan:11434")
+
+    def test_the_vision_model_dials_the_ipv4_literal(self):
+        from jarvis.config import load_config
+        from jarvis.vlm import Vision
+
+
+        cfg = load_config()
+        cfg.ollama_host = "http://localhost:11434"
+        self.assertEqual(Vision(cfg).host, "http://127.0.0.1:11434")
+
+    def _brain_host(self, ollama_host: str) -> str | None:
+        """The host the brain's ollama client was built with, or None.
+
+        pick_model is stubbed so the test does not need a live ollama; the
+        client is created immediately after it, so nothing else has to happen.
+        """
+        from jarvis.config import load_config
+        from jarvis.memory import Memory
+        import jarvis.brain as B
+        import ollama  # noqa: WPS433
+
+        seen: dict = {}
+        real_client, real_pick = ollama.Client, B.pick_model
+
+        class _FakeClient:
+            def __init__(self, host=None, timeout=None):
+                seen["host"] = host
+
+        def _fake_pick(_cfg):
+            return "qwen2.5:3b-instruct", "stubbed"
+
+        ollama.Client = _FakeClient  # type: ignore[assignment]
+        B.pick_model = _fake_pick  # type: ignore[assignment]
+        try:
+            cfg = load_config()
+            cfg.ollama_host = ollama_host
+            B.Brain(cfg, Memory(":memory:"))
+            return seen.get("host")
+        finally:
+            ollama.Client = real_client  # type: ignore[assignment]
+            B.pick_model = real_pick  # type: ignore[assignment]
+
+    def test_the_brain_client_dials_the_ipv4_literal(self):
+        self.assertEqual(self._brain_host("http://localhost:11434"),
+                         "http://127.0.0.1:11434")
+
+    def test_the_brain_client_keeps_a_remote_host(self):
+        self.assertEqual(self._brain_host("http://ollama.lan:11434"),
+                         "http://ollama.lan:11434")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -470,12 +470,59 @@ def save_config(cfg: Config) -> Path:
     return path
 
 
+def connect_host(host: str) -> str:
+    """The host to actually open a socket to, for a local ollama.
+
+    "localhost" is not free on this machine, and it is worth being precise about
+    why, because the cost is invisible in the code and enormous in the numbers.
+    Ollama listens on IPv4 only, while `localhost` resolves to `::1` first, so
+    every connection attempts the IPv6 address, is actively refused, and only
+    then falls back to 127.0.0.1. Measured, on this machine:
+
+        socket to ::1:11434        refused after 2.0557s
+        socket to 127.0.0.1:11434  connected in 0.0154s
+        requests to localhost      2.0869s
+        requests to 127.0.0.1      0.0160s
+
+    A bare `socket.create_connection` shows the same 2.06s, so it is the connect
+    and not the HTTP layer, and setting TCP_NODELAY changes nothing, so it is not
+    a delayed-ACK stall either. It is a refused connection that this machine
+    takes two seconds to give up on.
+
+    The app pays that twice before it can answer anything: once in
+    `pick_model` and once in the embedder probe. That was 4.1s of the measured
+    7.16s startup, on every launch, to reach a server 15ms away.
+
+    Only a loopback name is rewritten. A configured remote host is left exactly
+    as the user wrote it, because resolving a name to a literal for someone
+    else's machine would be a change of meaning rather than a speed-up.
+    """
+    text = (host or "").strip()
+    if not text:
+        return text
+    for scheme in ("https://", "http://"):
+        prefix = ""
+        if text.lower().startswith(scheme):
+            prefix = scheme
+            text = text[len(scheme):]
+            break
+    rest = text.split("/", 1)[1] if "/" in text else ""
+    netloc = text.split("/", 1)[0]
+    hostpart = netloc.rsplit(":", 1)[0] if ":" in netloc else netloc
+    if hostpart.strip("[]").lower() == "localhost":
+        return f"{prefix}127.0.0.1" + (
+            netloc[len(hostpart):] + (f"/{rest}" if rest else "")
+        )
+    return host
+
+
 def available_models(host: str, timeout: float = 3.0) -> list[str]:
     """Names of models installed in Ollama, or [] if it is not running."""
     import requests
 
     try:
-        resp = requests.get(f"{host.rstrip('/')}/api/tags", timeout=timeout)
+        resp = requests.get(f"{connect_host(host).rstrip('/')}/api/tags",
+                            timeout=timeout)
         resp.raise_for_status()
     except Exception:
         return []

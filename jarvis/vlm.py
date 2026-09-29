@@ -23,6 +23,8 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .config import connect_host
+
 log = logging.getLogger("jarvis.vlm")
 
 # moondream answers with a bracketed list of coordinates. It is usually a
@@ -83,7 +85,11 @@ class Vision:
         self.describe_model = (
             getattr(cfg, "vlm_describe_model", "") or self.model
         )
-        self.host = cfg.ollama_host.rstrip("/")
+        # connect_host, for the same reason the brain uses it: resolving
+        # "localhost" to ::1 and being refused costs about 2s per connection
+        # here, and a describe call makes fresh connections. See
+        # config.connect_host for the measurement.
+        self.host = connect_host(cfg.ollama_host).rstrip("/")
         self.timeout = float(getattr(cfg, "vlm_timeout", 120.0))
         self.max_side = int(getattr(cfg, "vlm_max_side", 896))
         # Describing sends a smaller image than pointing, but the size is close

@@ -76,6 +76,37 @@ from `--list-audio` to override.
 `qwen3:4b` is installed as a fallback but is not the default: it narrates tool
 calls and took 220–250s per turn on this machine.
 
+### Startup is 1.05s, and 4.1s of the old 7.15s was one refused connection
+
+Ollama listens on IPv4 only, but `localhost` resolves to `::1` first on this
+machine. Every connection therefore tries IPv6, gets refused, and only then falls
+back to 127.0.0.1. This machine takes just over **2 seconds** to give up on that
+refused attempt, and the app paid it twice before it could answer anything: once
+in `pick_model` and once in the embedder probe.
+
+| | Time |
+| --- | --- |
+| bare socket to `::1:11434` | refused after **2.0557s** |
+| bare socket to `127.0.0.1:11434` | connected in **0.0154s** |
+| `requests.get` to `localhost` | **2.0869s** |
+| `requests.get` to `127.0.0.1` | **0.0160s** |
+| `requests.Session` reuse | **0.004s** |
+
+A bare socket shows the same 2.06s, so the cost is in the connect and not in the
+HTTP layer, and setting `TCP_NODELAY` changes nothing, so it is not a
+delayed-ACK stall. It is a refused connection being abandoned slowly.
+
+`config.connect_host()` rewrites a loopback name to the IPv4 literal at the point
+of connection, and the embedder keeps one `Session` so a long session does not
+reconnect per call. A configured remote host is left exactly as written, because
+resolving someone else's machine to a literal would change its meaning.
+
+| Stage | Before | After |
+| --- | --- | --- |
+| `Brain()` | 2.751s | **0.661s** |
+| `Assistant()` | 4.076s | **0.050s** |
+| Total startup | 7.163s | **1.052s** |
+
 ### Measured speed
 
 The brain prefills at roughly **40 tokens/s** on 10 CPU cores. The system prompt
@@ -818,7 +849,7 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-367 tests, about 26 seconds, no external network and no model needed. They
+382 tests, about 26 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor

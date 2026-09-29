@@ -103,16 +103,26 @@ class OllamaEmbedder:
     def __init__(self, host: str, model: str, timeout: float = 30.0):
         import requests
 
+        from .config import connect_host
+
         self._requests = requests
-        self.host = host.rstrip("/")
+        # connect_host, and this one is the most expensive probe in the app:
+        # available() runs at startup, and resolving "localhost" to ::1 and
+        # being refused costs about 2s before it falls back to 127.0.0.1. See
+        # config.connect_host for the measurement.
+        self.host = connect_host(host).rstrip("/")
         self.model = model
         self.timeout = timeout
         self._lock = threading.Lock()
         self.dim = 0
+        # A plain requests.get opens a fresh connection every call. With the
+        # host resolved to a literal that is ~15ms rather than ~2s, but reusing
+        # one session means a long session does not pay it per call either.
+        self._session = requests.Session()
 
     def available(self) -> bool:
         try:
-            resp = self._requests.get(f"{self.host}/api/tags", timeout=2.0)
+            resp = self._session.get(f"{self.host}/api/tags", timeout=2.0)
             resp.raise_for_status()
             names = {m.get("name", "") for m in resp.json().get("models", [])}
         except Exception:  # noqa: BLE001
@@ -127,7 +137,7 @@ class OllamaEmbedder:
             return np.zeros((0, max(self.dim, 1)), dtype=np.float32)
         vectors: list[list[float]] = []
         for text in texts:
-            resp = self._requests.post(
+            resp = self._session.post(
                 f"{self.host}/api/embeddings",
                 json={"model": self.model, "prompt": text or " "},
                 timeout=self.timeout,
