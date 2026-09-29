@@ -491,23 +491,69 @@ asking both only invites the model to contradict a correct reading.
 
 **Cost, and what does not help.** With `qwen2.5vl` on CPU a describe call is
 78-93s, and about **97% of that is prefilling the image**: the model reports
-1112 prompt tokens at 112px, 160px, 224px, 256px, 320px, 384px, 448px and
-896px alike, because it pads whatever image it is given to a fixed token grid.
-So shrinking the picture saves nothing at all, and the earlier note here blaming
-image size was wrong. `vlm_describe_max_side` is kept at 448 only to keep the
-payload small; pointing keeps 896px because there the detail is the point.
+1099 prompt tokens at 96px, 128px, 168px, 224px, 336px, 448px, 560px, 672px,
+896px and 1120px alike, because it pads whatever image it is given to a fixed
+token grid. Cropping does not help either, for the same reason. So shrinking the
+picture saves nothing at all, and the earlier note here blaming image size was
+wrong. `vlm_describe_max_side` is kept at 448 only to keep the payload small;
+pointing keeps 896px because there the detail is the point.
 
-Two things that do help are now enforced:
+**The cost is per image, not per question.** This is the part the old
+description of this code had backwards, and it is worth stating precisely,
+because it is what makes the cache below work:
+
+| | Prefill rate |
+| --- | --- |
+| First question about a given image | ~78-88ms per token |
+| Any later question about the *same bytes* | ~0.5ms per token |
+
+Three questions against one screenshot took **71.74s, then 6.28s, then 3.11s**.
+Shift one region of that image by 40 levels and the first question is back to
+**91.66s**. The first call is what pays for ~1100 image tokens; `ollama` keeps
+the vision-encoder result and reuses it for identical bytes. The prompt text
+does not matter — a completely different question against the same image still
+costs 8.10s, then 2.55s.
+
+So `describe()` caches descriptions keyed on the encoded payload plus the
+question. Measured against the real model on a real screen:
+
+| | Time |
+| --- | --- |
+| First description of a screen | 81.89s |
+| Same screen, same question, asked again | **0.01s** |
+| Screen changed by one region | 86.18s |
+
+The key deliberately hashes the *encoded payload* rather than the array, so this
+cache and the server's own agree about what "the same image" means — a hit here
+predicts a cheap call there rather than the two disagreeing. The question is
+part of the key, because answering the wrong question quickly is worse than
+answering slowly. Only a *usable* answer is stored: caching a confabulation
+would leave that screen permanently undescribable, since every later call would
+be a hit on the junk and the miss would never be retried.
+
+Set `vlm_describe_cache_entries` to 0 to disable it, which is the honest setting
+if the screen is expected to change between every question anyway.
+
+**What still does not help, re-measured.** Swapping in the faster model is a
+false economy. `moondream` prefills 748 tokens in ~14s where `qwen2.5vl` takes
+~80s, so it looks like a 6x win — but it is not a usable substitute. Asked about
+a deliberately photo-like screen with no text on it, `moondream` answered
+`urn of water` where `qwen2.5vl` answered `a window showing a beach`, and on a
+blank screen it returned nothing at all. Using it as a cheap first pass and
+escalating would cost 14s + 80s and end up slower than simply waiting, with a
+worse answer on the way there.
+
+Two things that do help are enforced:
 
 - `vlm_describe_num_predict` (96) caps generation. Good answers are 15-25
   tokens, so the cap costs nothing there, but `moondream` once spent all 256
   tokens emitting `urn:jars:li:9:0:0:0...` for 16s of generation and no answer.
-- `vlm_describe_budget_seconds` (150) bounds a whole describe. A screen with
-  little text takes the three-question path, and three cold image prefills is
-  four to five minutes for one description; once the budget is spent the
-  remaining questions are skipped and the partial answer is returned. The answer
-  degrades instead of the user hanging. A specific question you asked directly
-  is never gated by it.
+- `vlm_describe_budget_seconds` (150) bounds a whole describe. It is protection
+  against a cold image or a model that is slow for some other reason, not
+  against three questions each costing 80-90s, which is what the old comment
+  here claimed. Once the budget is spent the remaining questions are skipped and
+  the partial answer is returned, so the answer degrades instead of the user
+  hanging. A specific question you asked directly is never gated by it.
 
 Repeats are genuinely cheap: the same screenshot bytes hit Ollama's prompt
 cache, so an identical call drops from 97.8s to 3.0s. That is a cache effect,
@@ -647,7 +693,7 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-338 tests, about 26 seconds, no external network and no model needed. They
+349 tests, about 26 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor
@@ -701,6 +747,17 @@ expensive: that `system_prompt()` does not change when the clock moves, that the
 clock still reaches the model on the user's message rather than in the system
 prompt, and that stored history does not accumulate clock notes, which would
 break the cache again a turn later.
+
+The describe cache has its own class, `TestVlmDescribeCache`, because a stale
+description served for a screen that has moved on is worse than no description
+at all. It asserts that the same screen is described once, that a changed screen
+is described again, that a different question is a different answer, that the
+multi-question path is cached as one unit rather than three independent
+questions, that the cache is bounded and evicts least-recently-used, that
+disabling it always asks, and — the one the code got wrong first time — that an
+*unusable* answer is not stored, since caching a confabulation would leave that
+screen permanently undescribable. It also pins that the key follows the bytes
+actually sent to the model, so a hit here predicts a cheap call to the server.
 
 Confirmation is covered as well: that a reply starts unconfirmed, that user
 rows cannot be marked confirmed, that a confirmed reply becomes evidence while
@@ -905,10 +962,11 @@ Useful ones:
 | `vlm_model` | `moondream` | Model used for pointing |
 | `vlm_describe_model` | `qwen2.5vl:3b` | Model used for describing. `""` reuses `vlm_model` |
 | `vlm_max_side` | `896` | Longest side sent to the pointing model |
-| `vlm_describe_max_side` | `448` | Longest side sent to the describing model. Affects payload size, not latency |
+| `vlm_describe_max_side` | `448` | Longest side sent to the describing model. Affects payload size, not latency: the model pads to a fixed token grid at every size tried |
 | `vlm_num_predict` | `256` | Generation cap for pointing |
 | `vlm_describe_num_predict` | `96` | Generation cap for describing. Bounds degenerate output |
-| `vlm_describe_budget_seconds` | `150.0` | Wall-clock ceiling for a whole describe, across all its questions. `0` disables |
+| `vlm_describe_budget_seconds` | `150.0` | Wall-clock ceiling for a whole describe, across all its questions. `0` disables. Guards a cold image, not the per-question cost — only the first question is expensive |
+| `vlm_describe_cache_entries` | `24` | How many screen descriptions to keep, keyed on the image bytes and the question. Least-recently-used. A repeat description of an unchanged screen measured 0.01s against 81.89s cold; `0` disables |
 | `vlm_timeout` | `300.0` | Seconds before a vision call fails |
 | `request_timeout` | `420.0` | Seconds before a brain call fails |
 | `keep_alive` | `30m` | How long Ollama holds the model and its prompt cache. Costs 3.4 GB while resident; shortening it brings the 92s cold prefill back |

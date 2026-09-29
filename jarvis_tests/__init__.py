@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import sqlite3
 import sys
+from collections import OrderedDict
 import tempfile
 import time
 import unittest
@@ -1853,6 +1854,18 @@ class TestVlmCorroboration(unittest.TestCase):
         )
 
 
+def _fake_screen(seed: int = 0):
+    """A tiny real image, for describe() tests that now hash the payload.
+
+    The describe path keys its cache on the encoded bytes, so these tests need
+    an actual array rather than object(). Four pixels is enough; nothing here is
+    ever sent to a model.
+    """
+    img = np.zeros((4, 4, 3), dtype=np.uint8)
+    img[0, 0] = seed % 256
+    return img
+
+
 class TestVlmDescribeFailsFast(unittest.TestCase):
     """Two of three describe passes on a real window were confabulations and
     cost ~35s. Once the model has produced nothing usable, the remaining passes
@@ -1870,6 +1883,8 @@ class TestVlmDescribeFailsFast(unittest.TestCase):
                 self.describe_max_side = 448
                 self.describe_num_predict = 96
                 self.describe_budget = 150.0
+                self._describe_cache = OrderedDict()
+                self._describe_cache_max = 24
 
             def _ask(self, image, prompt, model="", max_side=None, num_predict=None):
                 asked.append(prompt)
@@ -1877,7 +1892,7 @@ class TestVlmDescribeFailsFast(unittest.TestCase):
                     return "urn:jira:issue/uid:urn:jira:issue/uid:urn:jira:issue/uid:"
                 return "A code editor."
 
-        out = Fake().describe(object())
+        out = Fake().describe(_fake_screen())
         self.assertEqual(len(asked), 1, f"asked {len(asked)} times: {asked}")
         self.assertEqual(out, "", "a confabulation must not be reported as a description")
 
@@ -1891,11 +1906,13 @@ class TestVlmDescribeFailsFast(unittest.TestCase):
                 self.describe_max_side = 448
                 self.describe_num_predict = 96
                 self.describe_budget = 150.0
+                self._describe_cache = OrderedDict()
+                self._describe_cache_max = 24
 
             def _ask(self, image, prompt, model="", max_side=None, num_predict=None):
                 return f"answer for {prompt[:12]}"
 
-        out = Fake().describe(object())
+        out = Fake().describe(_fake_screen())
         self.assertEqual(len(out.splitlines()), len(Vision._DETAIL_PROMPTS))
 
     def test_question_short_circuits_the_pass_sequence(self):
@@ -1910,13 +1927,15 @@ class TestVlmDescribeFailsFast(unittest.TestCase):
                 self.describe_max_side = 448
                 self.describe_num_predict = 96
                 self.describe_budget = 150.0
+                self._describe_cache = OrderedDict()
+                self._describe_cache_max = 24
 
             def _ask(self, image, prompt, model="", max_side=None, num_predict=None):
                 asked.append(prompt)
                 return "The error says disk full."
 
         self.assertEqual(
-            Fake().describe(object(), "what does the error say?"),
+            Fake().describe(_fake_screen(), "what does the error say?"),
             "The error says disk full.",
         )
         self.assertEqual(len(asked), 1)
@@ -2244,7 +2263,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
         "corroboration check vim python script window terminal file edit saved"
     )
 
-    def _vision(self, describe_side=448, point_side=896):
+    def _vision(self, describe_side=448, point_side=896, cache_entries=24):
         from jarvis.vlm import Vision
 
         class Cfg:
@@ -2257,6 +2276,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
             vlm_num_predict = 256
             vlm_describe_num_predict = 96
             vlm_describe_budget_seconds = 150.0
+            vlm_describe_cache_entries = cache_entries
 
         return Vision(Cfg())
 
@@ -2283,7 +2303,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
     def test_describe_uses_the_small_size(self):
         v = self._vision()
         seen = self._record(v)
-        v.describe(object(), ocr_text=self.RICH_OCR)
+        v.describe(_fake_screen(), ocr_text=self.RICH_OCR)
         self.assertTrue(seen, "the model was never asked")
         for call in seen:
             self.assertEqual(call["max_side"], 448, f"describe passed {seen}")
@@ -2308,7 +2328,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
     def test_describe_uses_the_describe_model(self):
         v = self._vision()
         seen = self._record(v)
-        v.describe(object(), ocr_text=self.RICH_OCR)
+        v.describe(_fake_screen(), ocr_text=self.RICH_OCR)
         self.assertEqual(seen[0]["model"], "qwen2.5vl:3b")
 
     def test_prepare_scales_to_the_requested_side(self):
@@ -2353,7 +2373,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
 
         v = self._vision()
         seen = self._record(v)
-        v.describe(object(), ocr_text=self.RICH_OCR)
+        v.describe(_fake_screen(), ocr_text=self.RICH_OCR)
         self.assertEqual(len(seen), 1, f"asked {len(seen)} times: {seen}")
         self.assertEqual(seen[0]["prompt"], Vision._SINGLE_PROMPT)
 
@@ -2363,7 +2383,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
 
         v = self._vision()
         seen = self._record(v)
-        out = v.describe(object(), ocr_text="")
+        out = v.describe(_fake_screen(), ocr_text="")
         self.assertEqual(len(seen), len(Vision._DETAIL_PROMPTS))
         self.assertEqual(out.count("\n- "), len(Vision._DETAIL_PROMPTS) - 1)
 
@@ -2372,7 +2392,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
         once spent all 256 tokens emitting "urn:jars:li:9:0:0:0..."."""
         v = self._vision()
         seen = self._record(v)
-        v.describe(object(), ocr_text=self.RICH_OCR)
+        v.describe(_fake_screen(), ocr_text=self.RICH_OCR)
         self.assertEqual(seen[0]["num_predict"], 96)
 
     def test_pointing_keeps_its_own_token_budget(self):
@@ -2398,7 +2418,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
         real_monotonic = vlm_mod.time.monotonic
         vlm_mod.time.monotonic = lambda: next(clock)
         try:
-            out = v.describe(object(), ocr_text="")
+            out = v.describe(_fake_screen(), ocr_text="")
         finally:
             vlm_mod.time.monotonic = real_monotonic
 
@@ -2420,7 +2440,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
         real_monotonic = vlm_mod.time.monotonic
         vlm_mod.time.monotonic = lambda: next(clock)
         try:
-            out = v.describe(object(), ocr_text="")
+            out = v.describe(_fake_screen(), ocr_text="")
         finally:
             vlm_mod.time.monotonic = real_monotonic
 
@@ -2433,7 +2453,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
 
         v = self._vision()
         seen = self._record(v)
-        v.describe(object(), ocr_text="")
+        v.describe(_fake_screen(), ocr_text="")
         self.assertEqual(len(seen), len(Vision._DETAIL_PROMPTS))
 
     def test_a_direct_question_is_not_gated_by_the_budget(self):
@@ -2444,7 +2464,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
         v = self._vision()
         v.describe_budget = 0.0
         seen = self._record(v)
-        out = v.describe(object(), question="What is the app name?")
+        out = v.describe(_fake_screen(), question="What is the app name?")
         self.assertEqual(len(seen), 1)
         self.assertIn("terminal window", out)
 
@@ -2456,7 +2476,7 @@ class TestVlmDescribeSizing(unittest.TestCase):
         v = self._vision()
         v.describe_budget = 0.0
         seen = self._record(v)
-        out = v.describe(object(), ocr_text=self.RICH_OCR)
+        out = v.describe(_fake_screen(), ocr_text=self.RICH_OCR)
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0]["prompt"], Vision._SINGLE_PROMPT)
         self.assertIn("terminal window", out)
@@ -4649,6 +4669,155 @@ class _FastPathMemory:
 
     def recent(self, *a, **k):
         return []
+
+
+class TestVlmDescribeCache(unittest.TestCase):
+    """Describing the same screen twice must not cost 71-91s twice.
+
+    The measurement this rests on: with qwen2.5vl on a real 1920x1200 screen,
+    three questions against one image took 71.74s, 6.28s and 3.11s, and
+    changing one region by 40 levels put the first one back to 91.66s. The cost
+    is per distinct image, not per question, because the first call is what
+    pays for ~1100 image tokens and ollama keeps the result.
+
+    So the cache is keyed on the encoded bytes: a hit here predicts a cheap call
+    to the server, and a changed screen is correctly a miss.
+    """
+
+    def _vision(self, entries=24, answer="A terminal window."):
+        from jarvis.vlm import Vision
+
+        class Cfg:
+            vlm_model = "moondream"
+            vlm_describe_model = "qwen2.5vl:3b"
+            ollama_host = "http://localhost:11434"
+            vlm_timeout = 300.0
+            vlm_max_side = 896
+            vlm_describe_max_side = 448
+            vlm_num_predict = 256
+            vlm_describe_num_predict = 96
+            vlm_describe_budget_seconds = 150.0
+            vlm_describe_cache_entries = entries
+
+        v = Vision(Cfg())
+        self.asked: list[str] = []
+        counter = [0]
+
+        def fake_ask(image, prompt, model="", max_side=None, num_predict=None):
+            self.asked.append(prompt)
+            counter[0] += 1
+            # Distinguishable per call, so a stale answer cannot masquerade as
+            # a fresh one in the assertions below.
+            return f"{answer} ({counter[0]})"
+
+        v._ask = fake_ask
+        return v
+
+    def test_the_same_screen_is_described_once(self):
+        v = self._vision()
+        first = v.describe(_fake_screen(1), "what is this window?")
+        second = v.describe(_fake_screen(1), "what is this window?")
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.asked), 1, f"asked {len(self.asked)} times")
+
+    def test_the_multi_question_path_is_cached_as_one_unit(self):
+        # The three detail prompts are not independent: the first one is what
+        # pays the image cost and the other two ride on it. So the cache holds
+        # the joined result, and a repeat must not re-ask any of them.
+        from jarvis.vlm import Vision
+
+        v = self._vision()
+        first = v.describe(_fake_screen(1))
+        self.assertEqual(len(self.asked), len(Vision._DETAIL_PROMPTS))
+        before = len(self.asked)
+        second = v.describe(_fake_screen(1))
+        self.assertEqual(first, second)
+        self.assertEqual(
+            len(self.asked), before, f"re-asked {len(self.asked) - before} times"
+        )
+
+    def test_a_changed_screen_is_described_again(self):
+        # The dangerous direction: a stale description served for a screen that
+        # has moved on is worse than no description at all.
+        v = self._vision()
+        v.describe(_fake_screen(1), "what is this window?")
+        v.describe(_fake_screen(2), "what is this window?")
+        self.assertEqual(len(self.asked), 2, "a changed screen reused a description")
+
+    def test_a_different_question_is_a_different_answer(self):
+        # Answering the wrong question quickly would be worse than answering
+        # slowly, so the question is part of the key.
+        v = self._vision()
+        v.describe(_fake_screen(1), "what is this window?")
+        v.describe(_fake_screen(1), "what is the app name?")
+        self.assertEqual(len(self.asked), 2, "the second question reused the first answer")
+
+    def test_the_unchanged_screen_case_still_hits_the_cache(self):
+        v = self._vision()
+        # Past the 12-content-word threshold, so this is the single-prompt path
+        # rather than the three-question one.
+        rich = (
+            "Hoopa's Vault OCR bot setup search clipping bot Jarvis assistant "
+            "corroboration check vim python script window terminal file edit saved"
+        )
+        a = v.describe(_fake_screen(1), ocr_text=rich)
+        b = v.describe(_fake_screen(1), ocr_text=rich)
+        self.assertEqual(a, b)
+        self.assertEqual(len(self.asked), 1)
+
+    def test_the_cache_is_bounded_and_evicts_the_least_recently_used(self):
+        v = self._vision(entries=2)
+        for seed in (1, 2, 3):
+            v.describe(_fake_screen(seed), "q")
+        self.assertLessEqual(
+            len(v._describe_cache), 2, f"cache grew to {len(v._describe_cache)}"
+        )
+        # 1 was evicted, so it costs a call again.
+        before = len(self.asked)
+        v.describe(_fake_screen(1), "q")
+        self.assertEqual(len(self.asked), before + 1, "the evicted entry was reused")
+
+    def test_disabling_the_cache_always_asks(self):
+        v = self._vision(entries=0)
+        v.describe(_fake_screen(1), "q")
+        v.describe(_fake_screen(1), "q")
+        self.assertEqual(len(self.asked), 2, "a disabled cache still returned a hit")
+
+    def test_an_unusable_answer_is_not_cached(self):
+        # Caching "" would mean a screen that becomes describable later keeps
+        # returning nothing, because the miss would never be retried.
+        v = self._vision()
+        bad = "urn:jira:issue/uid:urn:jira:issue/uid:urn:jira:issue/uid:"
+
+        def fake_ask(image, prompt, model="", max_side=None, num_predict=None):
+            self.asked.append(prompt)
+            return bad if len(self.asked) == 1 else "A code editor."
+
+        v._ask = fake_ask
+        v.describe(_fake_screen(1), "q")
+        v.describe(_fake_screen(1), "q")
+        self.assertEqual(len(self.asked), 2, "an unusable answer was cached as a hit")
+
+    def test_the_key_follows_the_bytes_sent_to_the_model(self):
+        # Both this cache and ollama's key on the encoded payload. If they
+        # disagreed, a hit here would predict an expensive call there.
+        from jarvis.vlm import Vision
+
+        v = self._vision()
+        k1 = v._image_key(_fake_screen(1), "q", "m")
+        k2 = v._image_key(_fake_screen(1), "q", "m")
+        k3 = v._image_key(_fake_screen(2), "q", "m")
+        self.assertEqual(k1, k2, "the same pixels gave different keys")
+        self.assertNotEqual(k1, k3, "different pixels gave the same key")
+
+    def test_the_key_separates_models(self):
+        from jarvis.vlm import Vision
+
+        v = self._vision()
+        self.assertNotEqual(
+            v._image_key(_fake_screen(1), "q", "moondream"),
+            v._image_key(_fake_screen(1), "q", "qwen2.5vl:3b"),
+        )
 
 
 if __name__ == "__main__":
