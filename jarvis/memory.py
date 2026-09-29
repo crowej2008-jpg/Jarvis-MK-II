@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS notes (
     tags    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_notes_ts ON notes(ts);
+
+-- The oldest message id the replayed-history window currently starts at.
+-- Persisted because it has to survive between processes: recomputing it each
+-- turn is what made the window slide, see growing_window().
+CREATE TABLE IF NOT EXISTS prompt_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 # Added after the first release. Existing databases need the column before any
@@ -69,6 +77,9 @@ class Message:
 
     def as_dict(self) -> dict[str, str]:
         return {"role": self.role, "content": self.content}
+
+
+_WINDOW_ANCHOR = "history_window_anchor_id"
 
 
 def _fts_query(text: str) -> str:
@@ -187,6 +198,140 @@ class Memory:
 
     def history_for(self, limit: int = 40) -> list[dict[str, str]]:
         return [m.as_dict() for m in self.recent(limit)]
+
+    def growing_window(
+        self, max_chars: int, trim_slack: float = 0.25
+    ) -> list[dict[str, str]]:
+        """An append-only view of the transcript, anchored and trimmed in chunks.
+
+        `recent()` is newest-n, so the message sitting at position 0 changes on
+        every turn. Ollama can only reuse a cached prompt when the new prompt
+        starts with the same tokens, so a sliding window makes the whole history
+        block re-prefilled on every turn. Measured on real turns that was
+        9.78-17.01s, against 0.15s when the prefix was stable.
+
+        Two obvious fixes both fail, and it is worth being explicit about why,
+        because both look correct on inspection:
+
+        "Newest messages that fit the budget" slides just as much as recent().
+        Once a conversation is longer than the budget it is over budget on
+        *every* later turn, so it drops one message per turn. Measured: a
+        23,662-char transcript against an 8,000-char budget moved position 0 on
+        every single turn, for a 1.2x improvement rather than the ~100x the cache
+        is worth.
+
+        Trimming back by a slack margin per call, recomputed each time, also
+        slides - and worse, it looked correct in a simulation. A chunked
+        overshoot measured 1 move in 60 turns offline but 6 in 7 on the live
+        transcript, because the break fires on the first message once the budget
+        is already spent, so the window creeps forward one message per turn
+        regardless of the chunk size. An offline harness with uniform synthetic
+        messages cannot see that; the real transcript, with wildly uneven
+        message lengths, can.
+
+        So the anchor is *persisted* rather than recomputed. It moves only when
+        the budget is genuinely exceeded, and then it jumps forward far enough
+        to leave `trim_slack` of the budget free, so it stays put until that
+        much new conversation has accumulated. Between trims the returned list
+        only ever grows, which is the property the cache needs.
+
+        Returns oldest-first, which is the order the model needs.
+        """
+        budget = max(0, int(max_chars))
+        if budget <= 0:
+            return []
+        slack = min(0.9, max(0.0, float(trim_slack)))
+
+        with self._lock:
+            anchor = self._prompt_state_get(_WINDOW_ANCHOR)
+            anchor_id = None
+            if anchor is not None:
+                try:
+                    anchor_id = int(anchor)
+                except ValueError:
+                    anchor_id = None
+            if anchor_id is not None:
+                alive = self._conn.execute(
+                    "SELECT 1 FROM messages WHERE id = ?", (anchor_id,)
+                ).fetchone()
+                if not alive:
+                    # Messages were pruned out from under the anchor. Re-seed
+                    # rather than return a window with a hole in it.
+                    anchor_id = None
+
+            if anchor_id is None:
+                # First call, or the anchor was invalidated. Seed it to the
+                # oldest message that still fits the budget.
+                total = 0
+                seed_id = None
+                for row in self._conn.execute(
+                    "SELECT id, content FROM messages ORDER BY id DESC"
+                ):
+                    content = row["content"] or ""
+                    if total + len(content) > budget and seed_id is not None:
+                        break
+                    total += len(content)
+                    seed_id = row["id"]
+                if seed_id is None:
+                    return []
+                anchor_id = seed_id
+                self._prompt_state_set(_WINDOW_ANCHOR, str(anchor_id))
+
+            rows = self._conn.execute(
+                "SELECT id, role, content FROM messages WHERE id >= ? ORDER BY id",
+                (anchor_id,),
+            ).fetchall()
+
+            total = sum(len(r["content"] or "") for r in rows)
+            if total > budget and len(rows) > 1:
+                # Genuinely over budget. Jump the anchor forward until what
+                # remains fits within (1 - slack) of the budget, so it will not
+                # need to move again until that much has been said.
+                target = int(budget * (1.0 - slack))
+                drop = total - target
+                dropped = 0
+                new_anchor = anchor_id
+                for row in rows:
+                    if dropped >= drop and new_anchor != anchor_id:
+                        break
+                    n = len(row["content"] or "")
+                    dropped += n
+                    new_anchor = row["id"]
+                # Never trim away the entire window.
+                if new_anchor > anchor_id:
+                    self._prompt_state_set(_WINDOW_ANCHOR, str(new_anchor))
+                    rows = [r for r in rows if r["id"] >= new_anchor]
+                    if not rows:
+                        rows = self._conn.execute(
+                            "SELECT id, role, content FROM messages "
+                            "WHERE id >= ? ORDER BY id", (new_anchor,),
+                        ).fetchall()
+
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+    def _prompt_state_get(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM prompt_state WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def _prompt_state_set(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO prompt_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
+
+    def reset_history_window(self) -> None:
+        """Forget the window anchor, so the next growing_window() re-seeds it."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM prompt_state WHERE key = ?", (_WINDOW_ANCHOR,)
+            )
+            self._conn.commit()
 
     def search_messages(self, query: str, limit: int = 15) -> list[dict[str, Any]]:
         with self._lock:

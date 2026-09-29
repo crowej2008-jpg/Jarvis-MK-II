@@ -748,7 +748,17 @@ class Brain:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompt}
         ]
-        messages.extend(self.memory.history_for(self.cfg.keep_last_messages))
+        # Append-only, not newest-n. recent() slides, so position 0 changes every
+        # turn and the model re-prefills the whole history block each time.
+        # Measured on real turns that was 9.78-17.01s of prefill against 0.15s
+        # when the prefix was stable - the single largest cost in ordinary use.
+        # growing_window() only grows until it hits the budget, so the prefix is
+        # byte-identical turn to turn and the model reuses all but the new
+        # exchange. It only shifts when the budget is genuinely exceeded, and
+        # that one re-prefill is amortised over every turn until then.
+        messages.extend(self.memory.growing_window(
+            self.cfg.history_char_budget, self.cfg.history_trim_slack,
+        ))
 
         user: dict[str, Any] = {
             "role": "user",

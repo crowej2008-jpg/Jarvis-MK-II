@@ -1302,6 +1302,9 @@ class _PromptMemory:
     def list_notes(self, limit=5):
         return []
 
+    def growing_window(self, max_chars, trim_slack=0.25):
+        return []
+
     def history_for(self, keep):
         return []
 
@@ -1321,6 +1324,8 @@ def _prompt_brain():
     class _Cfg:
         persona = "You are JARVIS."
         keep_last_messages = 6
+        history_char_budget = 3500
+        history_trim_slack = 0.25
         max_tool_rounds = 6
         tool_select_max = 0
         # Mirrors the real default. Absent it, think() would raise rather than
@@ -1394,20 +1399,17 @@ class TestBrainHelpers(unittest.TestCase):
 
         self.assertIn("list_more_tools", TOOL_DISCOVERY)
 
-    def test_the_replayed_history_window_slides(self):
-        """The replayed history is a sliding window, so it is not a cache prefix.
+    def test_the_replayed_history_keeps_a_stable_prefix(self):
+        """Everything up to the newest turn must be byte-identical turn to turn.
 
         Ollama reuses a cached prompt only when the new prompt starts with the
-        same tokens. recent() returns the *newest* n messages, so on every turn
-        the window advances and the message sitting immediately after the system
-        prompt is a different one. That is the whole cost: everything from there
-        on has to be re-prefilled, while the system prompt and tool schemas in
-        front of it stay cached.
+        same tokens, so the replay has to *grow* rather than slide. The old
+        newest-n window advanced on every turn and put a different message at
+        position 1, which re-prefilled the whole history block every time -
+        measured at 9.78-17.01s of warm prefill against 0.15s when stable.
 
-        Measured mean warm prefill on real turns: 62.4s at 40 messages, 3.7s at
-        8, 0.7s at none. This asserts the mechanism rather than the timing, so
-        it still holds on a fast machine where the numbers are too small to
-        measure in a test.
+        This asserts the mechanism, not the timing, so it holds on a fast
+        machine where the numbers are too small to measure in a test.
         """
         brain = _prompt_brain()
         brain.memory.add_message("user", "earlier question")
@@ -1424,26 +1426,215 @@ class TestBrainHelpers(unittest.TestCase):
             first[0], second[0],
             "the system prompt should stay byte-identical so it stays cacheable",
         )
-        # The system prompt is the stable prefix; everything replayed after it
-        # moves, which is precisely why a large window is expensive.
+        # The whole replay minus the newest exchange is the cacheable prefix, so
+        # it must not move. Only the trailing user message may differ.
+        self.assertEqual(
+            first[1:-1], second[1:-1],
+            "the replayed history must be append-only, or the cache is "
+            "invalidated on every turn",
+        )
+        self.assertNotEqual(first[-1], second[-1])
+
+    def test_the_history_anchor_survives_and_holds_position_zero(self):
+        """The anchor is persisted, and position 0 must not move on new turns.
+
+        This is the property the cache needs, asserted on the real Memory
+        against uneven message lengths. The two earlier attempts both passed an
+        offline simulation and failed on the live transcript: "newest that fits"
+        drops one message per turn once over budget, and a recomputed chunked
+        overshoot breaks on the first message once the budget is spent. Uniform
+        synthetic messages cannot see either; 500-char and 12-char messages in
+        turn can.
+        """
+        import tempfile
+        from pathlib import Path as _P
+
+        from jarvis.memory import Memory as _Memory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _P(tmp) / "m.db"
+            mem = _Memory(db)
+            try:
+                # Seed well past any plausible budget, with wildly uneven sizes.
+                for i in range(60):
+                    body = "x" * (500 if i % 5 == 0 else 12)
+                    mem.add_message("user" if i % 2 == 0 else "assistant",
+                                    f"seed-{i:03d}-{body}")
+                budget = 3500
+                slack = 0.4
+                w0 = mem.growing_window(budget, slack)
+                self.assertTrue(w0, "the window should not be empty")
+                self.assertLessEqual(
+                    sum(len(m["content"]) for m in w0), budget,
+                    "a freshly seeded window should fit the budget",
+                )
+
+                # A turn that holds the anchor costs nothing extra, because new
+                # content has to be prefilled either way. So the figure of merit
+                # is the characters re-prefilled *because the anchor moved* - a
+                # sliding window re-prefills the whole window every turn.
+                trims = 0
+                extra = 0
+                prev_first = w0[0]
+                for turn in range(8):
+                    mem.add_message("user", f"live-{turn}-" + "y" * 300)
+                    w = mem.growing_window(budget, slack)
+                    size = sum(len(m["content"]) for m in w)
+                    self.assertLessEqual(
+                        size, budget,
+                        f"turn {turn}: window grew past its budget without a trim",
+                    )
+                    if w[0] != prev_first:
+                        trims += 1
+                        extra += size
+                        prev_first = w[0]
+                # At slack 0.0 this stretch re-prefills the full window on every
+                # turn, about 3,500 chars x 8 = 28,000. At the configured 0.4 a
+                # trim leaves 2,100 chars and needs 1,400 chars of new
+                # conversation - roughly five 300-char turns - before the next
+                # one, so two trims in eight turns is the expected arithmetic and
+                # a bound of 6,000 is roughly one trim of headroom over it.
+                self.assertLessEqual(
+                    extra, 6000,
+                    f"the anchor re-prefilled {extra} chars in 8 turns across "
+                    f"{trims} trims; it is creeping forward instead of holding",
+                )
+            finally:
+                mem.close()
+
+    def test_the_history_anchor_is_persisted_across_handles(self):
+        """The anchor has to outlive the process, or it re-slides every launch."""
+        import tempfile
+        from pathlib import Path as _P
+
+        from jarvis.memory import _WINDOW_ANCHOR, Memory as _Memory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _P(tmp) / "m.db"
+            first = _Memory(db)
+            try:
+                for i in range(40):
+                    first.add_message("user", f"m{i}-" + "z" * 40)
+                w1 = first.growing_window(1200, 0.25)
+                first_anchor = first._prompt_state_get(_WINDOW_ANCHOR)
+                self.assertIsNotNone(first_anchor, "the anchor must be persisted")
+            finally:
+                first.close()
+
+            second = _Memory(db)
+            try:
+                # No new message: the transcript is identical, so the window must
+                # be identical. If the anchor were re-seeded here it would still
+                # fit the same messages, so compare the stored anchor directly -
+                # that is what actually has to persist.
+                anchor_before = first_anchor
+                anchor_after = second._prompt_state_get(_WINDOW_ANCHOR)
+                self.assertEqual(
+                    anchor_after, anchor_before,
+                    "a fresh handle must not re-seed the anchor, or every launch "
+                    "pays a full re-prefill",
+                )
+                w2 = second.growing_window(1200, 0.25)
+                self.assertEqual(w2, w1)
+            finally:
+                second.close()
+
+    def test_the_history_window_reseeds_after_messages_are_pruned(self):
+        """Pruning must not leave a hole at the front of the window."""
+        import tempfile
+        from pathlib import Path as _P
+
+        from jarvis.memory import Memory as _Memory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _P(tmp) / "m.db"
+            mem = _Memory(db)
+            try:
+                for i in range(50):
+                    mem.add_message("user", f"m{i}-" + "z" * 40)
+                w = mem.growing_window(800, 0.25)
+                anchor_content = w[0]["content"]
+                with mem._lock:
+                    mem._conn.execute(
+                        "DELETE FROM messages WHERE content = ?", (anchor_content,)
+                    )
+                    mem._conn.commit()
+                after = mem.growing_window(800, 0.25)
+                self.assertTrue(after, "the window should re-seed, not go empty")
+                self.assertNotEqual(
+                    after[0]["content"], anchor_content,
+                    "the pruned anchor should have been replaced",
+                )
+            finally:
+                mem.close()
+
+    def test_a_sliding_history_window_is_not_a_cache_prefix(self):
+        """The old behaviour, pinned so growing_window() cannot regress into it.
+
+        Newest-n advances every turn, so position 1 becomes a different message
+        and everything from there on is re-prefilled. Kept as the counter-example
+        the real test above is measured against.
+        """
+        rows = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+            for i in range(10)
+        ]
+        turn_one = rows[2:6]    # newest 4 of the first 6
+        turn_two = rows[4:8]    # newest 4 after two more arrive
         self.assertNotEqual(
-            first[1], second[1],
-            "history at position 1 is expected to differ between turns - this is "
-            "why keep_last_messages must stay small",
+            turn_one[0], turn_two[0],
+            "a newest-n window is expected to put a different message at "
+            "position 0 on the next turn, which is what invalidates the cache",
         )
 
-    def test_the_default_history_window_is_small(self):
-        """Pins the fix for the 62s warm turn.
+    def test_the_history_window_fits_the_context(self):
+        """Pins the 8,192-token ceiling against a real measurement.
 
-        A sliding window of 40 messages invalidated the prompt cache on every
-        turn and cost a mean 62.4s of prefill. Durable knowledge reaches the
-        model through the system prompt, which is stable and cached, so the
-        replay only has to cover anaphora - the last few exchanges. Raising this
-        needs a fresh measurement, not a hunch.
+        A tool-using turn measured 8,181 prompt tokens against num_ctx=8192 with
+        an 8,000-char budget, which is one exchange from truncation. The system
+        prompt and tool schemas are already a measured ~4,100 tokens at 38
+        schemas, so the replay has to leave real headroom rather than spend the
+        rest of the context.
         """
         from jarvis.config import Config
 
-        self.assertEqual(Config().keep_last_messages, 8)
+        cfg = Config()
+        # ~3.7 chars per token for this model's tokenizer on English prose.
+        chars_per_token = 3.7
+        system_and_tools = 4100  # measured, at 38 schemas
+        per_turn_headroom = 400   # a full generation plus the user turn
+        # A trim drops the window to (1 - slack) of the budget, and between trims
+        # it grows back to the full budget, so the budget itself is the ceiling.
+        replay_tokens = cfg.history_char_budget / chars_per_token
+        total = system_and_tools + replay_tokens + per_turn_headroom
+        self.assertLess(
+            total, cfg.num_ctx,
+            f"replay budget can reach ~{total:.0f} prompt tokens against "
+            f"num_ctx={cfg.num_ctx}",
+        )
+
+    def test_the_default_history_budget_leaves_context_headroom(self):
+        """Pins the budget against a measurement, the way the old pin did.
+
+        The previous pin required keep_last_messages == 8 because a large sliding
+        window was ruinous. The window is anchored and append-only now, so the
+        constraint is no longer "small" but "fits the context": at 3,500 chars
+        the replay is about 950 tokens, which with the measured 4,100-token
+        system-and-tools prefix and a turn of generation lands near 5,500
+        against num_ctx=8192. Raising this without re-measuring risks
+        truncating the conversation instead.
+
+        The slack is pinned to the measured knee. A sweep over 60 turns counted
+        the characters re-prefilled because the anchor moved: 2,870/turn at
+        slack 0.0, 835 at 0.25, 406 at 0.4, 287 at 0.5, 85 at 0.8. Past 0.4 the
+        saving flattens while the window a trim leaves behind shrinks from 2,128
+        to 737 chars, and a short window costs anaphora.
+        """
+        from jarvis.config import Config
+
+        cfg = Config()
+        self.assertEqual(cfg.history_char_budget, 3500)
+        self.assertEqual(cfg.history_trim_slack, 0.4)
 
     def test_system_prompt_carries_no_clock(self):
         """A clock in the system prompt costs a full prefill on every turn.

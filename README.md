@@ -132,13 +132,12 @@ same three turns now measure:
 back into the system prompt is exactly the kind of change that looks harmless.
 
 **The second cache-breaker was the conversation history, and it was the expensive
-one.** `recent()` returns the *newest* `keep_last_messages` rows, so the replayed
-window slides forward on every turn and the message sitting immediately after the
-system prompt is a different one each time. Ollama can only reuse a prompt that
-*starts* with the same tokens, so a sliding window makes the entire history block
-unreusable while the system prompt and tool schemas in front of it stay cached.
-The prefix that survives is ~3,900 tokens; the ~1,600 that move are re-evaluated
-from scratch, every turn.
+one.** The replayed window slid forward on every turn, so the message sitting
+immediately after the system prompt was a different one each time. Ollama can only
+reuse a prompt that *starts* with the same tokens, so a sliding window makes the
+entire history block unreusable while the system prompt and tool schemas in front
+of it stay cached. The prefix that survives is ~4,100 tokens; everything behind
+the moving boundary is re-evaluated from scratch, every turn.
 
 It looked harmless, too — more context for the model, no obvious cost. Measured
 mean warm prefill on real turns:
@@ -146,25 +145,74 @@ mean warm prefill on real turns:
 | `keep_last_messages` | Prompt tokens | Mean warm prefill |
 | --- | --- | --- |
 | 40 (was) | 5,552 | **62.4s** |
-| 8 (now) | 3,970 | **3.7s** |
+| 8 (first fix) | 3,970 | **3.7s** |
 | 0 | 3,916 | **0.7s** |
 
-A 17x improvement, and it was the single largest latency bug in the app. Worth
-being precise about how it was found, because the obvious theories were all
+A 17x improvement on paper, and it was the single largest latency bug in the app.
+Worth being precise about how it was found, because the obvious theories were all
 wrong: `num_ctx` was innocent, prompt size was innocent, streaming was innocent
 (blocking and streamed both hit the cache at 1.11s on an identical prefix), and
 the stored rows were never rewritten. What actually mattered was that the *first
 replayed message* moved, so no faithful replica of a *fixed* history reproduced
 it — only real, sliding turns did.
 
+**Then the fix turned out to be only 1.2x, because the window still slid.** The
+end-to-end harness still showed 9.78–17.01s of warm prefill, and shrinking the
+window to 8 messages had not touched the real cost. Two replacement designs both
+looked right and both failed, which is the useful part:
+
+*Newest messages that fit the budget* slides exactly as much as before. Once a
+conversation is longer than the budget it is over budget on *every* later turn, so
+it drops one message per turn. A 23,662-char transcript against an 8,000-char
+budget moved position 0 on all 60 simulated turns, for 1.2x rather than the ~100x
+the cache is worth.
+
+*Recomputing a chunked overshoot each turn* passed an offline simulation — 1 move
+in 60 turns — and then failed on the live transcript, 6 moves in 7. The break
+condition fires on the first message once the budget is already spent, so the
+window creeps forward regardless of the chunk size. Uniform synthetic messages
+cannot see that; the real transcript, with 500-char and 12-char messages
+interleaved, can. That is why the tests use uneven lengths.
+
+The fix that holds is to **persist the anchor**. `growing_window()` stores the
+oldest replayed message id in `prompt_state`, so it survives both turns and
+process restarts. It moves only when the budget is genuinely exceeded, and then it
+jumps back to `(1 - slack)` of the budget, so it stays put until that much new
+conversation has accumulated. Between trims the replay only ever grows, which is
+the property the cache needs.
+
+Real-model result on the live transcript, warm turns after the first:
+
+| | Warm prefill (median) | Warm turn (median) |
+| --- | --- | --- |
+| Sliding `recent()` | 9.78–17.01s | 19.08s |
+| Anchored window | **4.14s** | **12.67s** |
+
+`slack` was chosen by sweeping it over 60 turns and counting only the characters
+re-prefilled *because the anchor moved* — a turn that holds costs nothing extra,
+since new content is prefilled either way:
+
+| `slack` | Trims in 60 turns | Extra chars/turn | Deepest window |
+| --- | --- | --- | --- |
+| 0.00 | 49 | 2,870 | 2,854 |
+| 0.25 | 18 | 835 | 2,646 |
+| **0.40 (now)** | **11** | **406** | **2,128** |
+| 0.50 | 9 | 287 | 1,757 |
+| 0.80 | 6 | 85 | 737 |
+
+0.40 is the knee. Past it the saving flattens while the window a trim leaves
+behind shrinks fast, and a short window costs anaphora, which is the one thing
+the replay is for.
+
 Durable knowledge does not live in the replay. Facts, notes and visual memory all
 reach the model through the system prompt, which is stable and cached, so
 trimming the replay costs anaphora — "what about the second one?" — and not the
-assistant's memory. 8 keeps the last four exchanges for that, at 3.7s.
-`test_the_replayed_history_window_slides` asserts the mechanism (the system
-prompt stays identical, position 1 does not) rather than a timing, so it still
-holds on hardware too fast to measure this, and
-`test_the_default_history_window_is_small` pins the value.
+assistant's memory. `test_the_replayed_history_keeps_a_stable_prefix` asserts the
+mechanism (everything but the newest turn is byte-identical) rather than a timing,
+so it holds on hardware too fast to measure this.
+`test_the_history_anchor_survives_and_holds_position_zero` and
+`test_the_history_anchor_is_persisted_across_handles` cover the anchor itself, and
+`test_the_history_window_fits_the_context` pins the budget against `num_ctx`.
 
 Two things still cost a slow turn, both rare and both correct to pay for:
 saving a fact or a note changes the system prompt, and `list_more_tools`
@@ -736,7 +784,7 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-358 tests, about 26 seconds, no external network and no model needed. They
+363 tests, about 26 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor
@@ -1029,7 +1077,9 @@ Useful ones:
 | `vlm_timeout` | `300.0` | Seconds before a vision call fails |
 | `request_timeout` | `420.0` | Seconds before a brain call fails |
 | `keep_alive` | `30m` | How long Ollama holds the model and its prompt cache. Costs 3.4 GB while resident; shortening it brings the 92s cold prefill back |
-| `keep_last_messages` | `8` | How much raw conversation to replay each turn. **The most expensive setting here, and it looks free.** `recent()` takes the *newest* n rows, so the window slides every turn, the token after the system prompt changes, and the whole history block becomes unreusable. Mean warm prefill: 62.4s at 40, 3.7s at 8, 0.7s at 0. Facts and notes reach the model through the cached system prompt, so this only buys anaphora — raise it only with a measurement |
+| `keep_last_messages` | `24` | Cap on the replayed message count, independent of the budget below. It is not the window any more — the anchor in `history_char_budget` is. It exists only for a transcript of very short messages, where the character budget alone would not bind. **The most expensive setting here, and it looks free:** a newest-n window slides every turn, the token after the system prompt changes, and the whole history block becomes unreusable. Mean warm prefill: 62.4s at 40, 3.7s at 8, 0.7s at 0. Facts and notes reach the model through the cached system prompt, so the replay only buys anaphora — raise it only with a measurement |
+| `history_char_budget` | `3500` | Character budget for the replayed history. The window is **anchored and append-only**: `growing_window()` persists the oldest replayed message id in `prompt_state`, so the prompt prefix stays byte-identical turn to turn and the model reuses everything but the new exchange. It moves only when this budget is exceeded, then jumps back to `1 - history_trim_slack` of it. Warm prefill 9.78–17.01s → 4.14s, warm turn 19.08s → 12.67s. Capped low because the system prompt and 38 tool schemas are a measured ~4,100 tokens and `num_ctx` is 8,192; at 8,000 chars a tool turn reached 8,181 prompt tokens. `0` replays nothing, which costs all anaphora |
+| `history_trim_slack` | `0.4` | How far below `history_char_budget` a trim drops back to, as a fraction. Swept over 60 turns, counting only the characters re-prefilled *because the anchor moved*: 2,870/turn at 0.0, 835 at 0.25, **406 at 0.4**, 287 at 0.5, 85 at 0.8. 0.4 is the knee — past it the saving flattens while the window a trim leaves behind shrinks from 2,128 to 737 chars, and a short window costs anaphora. At 0.0 the anchor creeps forward one message per turn, which is the sliding window this replaced |
 | `num_predict` | `400` | Reply cap. Generation runs at 6.5–8.9 tok/s on CPU, so this is also the main lever on how long a turn feels: 400 tokens is ~50s |
 | `tool_select_max` | `0` | How many tools, chosen by relevance to the utterance, reach the prompt per turn. All 72 stay registered; this only narrows what is shown. `0`, the default, sends every core tool every turn, which keeps the prompt byte-identical so the cache keeps hitting. **Leave it at 0:** raising it cuts the cold turn from 68s to 45s but costs 15–40s on every *new* question, which is the common case. It does improve routing, 20/20 requests finding their tool against 13/20, so it is worth revisiting on hardware with faster prefill |
 | `fast_path` | `true` | Ask questions that show no sign of wanting a tool without attaching any tool schemas. Worth about an order of magnitude: 0.39–1.69s to first output against 7.65–8.97s with the 38-tool block. The gate is lopsided towards the tools on purpose, and a refusal from a no-tools answer is retried properly rather than returned. `false` always sends the tools |

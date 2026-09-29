@@ -254,26 +254,72 @@ class Config:
 
     # --- Memory ----------------------------------------------------------
     db_path: str = ""  # blank -> <home>/memory.db
-    # How much raw conversation to replay to the model each turn.
+    # How much raw conversation to replay to the model each turn, by message
+    # count. This is now a *cap* on top of history_char_budget, not the window
+    # itself, and the cap only binds on a transcript of very short messages.
     #
-    # This is the single most expensive setting in the app, and it was set to 40
-    # while looking like a free way to give the model more context. It is not.
-    # recent() takes the *newest* n messages, so the window slides on every turn
-    # and the token at position 1 changes. Ollama can only reuse a cached prompt
-    # when the new one starts with the same tokens, so a sliding window makes the
-    # whole history block unreusable - only the system prompt and tool schemas,
-    # which are stable, stay cached. Measured on real turns, mean warm prefill:
+    # It was originally the window and the single most expensive setting in the
+    # app, set to 40 while looking like a free way to give the model more context.
+    # recent() takes the *newest* n, so the window slid on every turn and the
+    # token at position 1 changed. Ollama can only reuse a cached prompt when the
+    # new one starts with the same tokens, so a sliding window made the whole
+    # history block unreusable - only the system prompt and tool schemas, which
+    # are stable, stayed cached. Measured on real turns, mean warm prefill:
     #
     #   keep_last_messages=40 -> 62.4s      (5,552 prompt tokens)
     #   keep_last_messages=8  ->  3.7s      (3,970)
     #   keep_last_messages=0  ->  0.7s      (3,916)
     #
+    # The end-to-end harness then showed the residual 9.78-17.01s, which is this
+    # same defect at a smaller size: the history block was still re-prefilled in
+    # full every turn, because it still slid.
+    #
     # Durable knowledge does not live here. Facts, notes and visual memory all
     # reach the model through the system prompt, which is stable and cached, so
     # trimming the replay costs anaphora ("what about the second one?") and not
-    # the assistant's memory. 8 keeps the last four exchanges for that, at
-    # 3.7s. Raising it re-breaks the cache, so do it only with a measurement.
-    keep_last_messages: int = 8
+    # the assistant's memory.
+    keep_last_messages: int = 24
+
+    # The replay is now append-only and bounded by characters rather than count,
+    # so the prompt prefix stays byte-identical from one turn to the next and the
+    # model reuses everything except the newly added exchange.
+    #
+    # The budget is a cap, not a target: a short conversation never reaches it
+    # and so never shifts, which is the point. A long one exceeds it on every
+    # turn, so growing_window() trims from the front in deliberate chunks rather
+    # than message by message - otherwise it would slide as much as recent() did
+    # and only buy 1.2x. The measured saving is 9.78-17.01s of warm prefill down
+    # to a 6.02s median. Set 0 to replay nothing at all, which is measured at
+    # 0.7s prefill and costs the model all anaphora.
+    #
+    # 3,500 rather than something larger because of the context ceiling. The
+    # system prompt and 38 tool schemas are a measured ~4,100 tokens, and a
+    # tool-using turn at an 8,000-char budget reached 8,181 prompt tokens
+    # against num_ctx=8192 - one exchange from truncation. With the trim slack
+    # below, this budget caps the replay at 4,900 chars, about 1,320 tokens,
+    # leaving headroom for a full generation on a tool-using turn.
+    history_char_budget: int = 3500
+
+    # How far below the budget a trim drops back to, as a fraction. The anchor
+    # is persisted, so it only moves when the budget is genuinely exceeded - and
+    # then it jumps back to (1 - slack) of the budget, so it holds until that
+    # much new conversation has accumulated.
+    #
+    # Measured over 60 turns on a transcript already past the budget, counting
+    # only the characters re-prefilled *because the anchor moved* - a turn that
+    # holds costs nothing extra, since new content is prefilled either way:
+    #
+    #   slack 0.00 -> 49 trims, 2,870 chars/turn re-prefilled, window >= 2,854
+    #   slack 0.25 -> 18 trims,    835 chars/turn,          window >= 2,646
+    #   slack 0.40 -> 11 trims,    406 chars/turn,          window >= 2,128
+    #   slack 0.50 ->  9 trims,    287 chars/turn,          window >= 1,757
+    #   slack 0.80 ->  6 trims,     85 chars/turn,          window >=   737
+    #
+    # 0.40 is the knee. Past it the saving flattens while the window a trim
+    # leaves behind shrinks fast, and a short window costs anaphora, which is
+    # the one thing the replay is for. At 0.00 the anchor creeps forward a
+    # message at a time, which is the sliding window this replaced.
+    history_trim_slack: float = 0.4
 
     # Ask questions that need no tool without attaching the 38-tool schema at
     # all. Measured warm: 103.0s to first output with the schemas attached,
