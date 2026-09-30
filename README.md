@@ -46,6 +46,7 @@ Unconfigured optional integrations report `SKIP`, not `FAIL`.
 ```powershell
 python -m jarvis              # voice, with wake word
 python -m jarvis --text       # type instead
+python -m jarvis --hud        # the heads-up display, type into it
 python -m jarvis --no-wake    # voice, push to talk
 python -m jarvis "what time is it"   # one-shot, then exit
 python -m jarvis --tools      # list every tool
@@ -53,6 +54,47 @@ python -m jarvis --show-config
 python -m jarvis --list-audio # input devices, to pick a microphone
 python -m jarvis --device 7   # use a specific microphone
 ```
+
+### The heads-up display
+
+`--hud` opens a display in the shape of the suit's, on the Iron Man HUD's own
+terms rather than a generic sci-fi theme. The design came out of two facts about
+the real thing: it was built on one recurring motif - concentric rings broken
+into exploded pie segments, ringed by radial ticks - and every element on it had
+a specific purpose, because a wearer in a fight does not read decoration. The
+palette went cyan in the Mark II, then to predominantly white for the Mark III,
+where the stated rule was that colour *accents* information instead of
+decorating it. So here the chrome is white and cyan and **colour only ever means
+a state**:
+
+| | Drawn in | Means |
+| --- | --- | --- |
+| Idle | dim cyan | ready, nothing running |
+| Warming, thinking | amber | waiting on the model |
+| Streaming | bright cyan | the answer is arriving |
+| Gate | amber, and a `GATE` line in the transcript | a dangerous tool needs a person |
+| Error | red | the turn failed, and says why |
+| Speaking | green | TTS is playing |
+
+The rings still when idle, brighten and turn while a turn runs, and the sweep
+line is the elapsed-time gauge - the point being that a prefill of 3,891 prompt
+tokens takes tens of seconds and would otherwise look like a hang. Nothing on the
+display moves or changes colour for decoration, and the test suite pins that: the
+colours are a closed set, and nothing is drawn in a colour that is not a state.
+
+It is a window onto the assistant, not a second one. It calls
+`Assistant.respond` and reads `Reply`; it never calls a tool, and a test asserts
+that it does not. It installs an approver exactly as `--text` does, so a
+destructive tool still cannot run without a person clicking through - and because
+the turn runs on a worker thread while the question blocks for up to `request_timeout`,
+the confirmation is marshalled onto the window's own thread, and a window that
+has gone away refuses rather than approves.
+
+The layout is measured rather than assumed: line heights and character widths
+come from the font metrics, because Tk scales by DPI and this display runs at
+200%. Both sides of the window share one floor, so the conversation and the fact
+list stop where the ring begins, and at 760x520 the least useful facts are
+dropped rather than drawn over the ring.
 
 ### Which microphone it listens to
 
@@ -200,7 +242,7 @@ the moving boundary is re-evaluated from scratch, every turn.
 It looked harmless, too — more context for the model, no obvious cost. Measured
 mean warm prefill on real turns:
 
-| `keep_last_messages` | Prompt tokens | Mean warm prefill |
+| `keep_last_messages` (since removed) | Prompt tokens | Mean warm prefill |
 | --- | --- | --- |
 | 40 (was) | 5,552 | **62.4s** |
 | 8 (first fix) | 3,970 | **3.7s** |
@@ -238,6 +280,15 @@ process restarts. It moves only when the budget is genuinely exceeded, and then 
 jumps back to `(1 - slack)` of the budget, so it stays put until that much new
 conversation has accumulated. Between trims the replay only ever grows, which is
 the property the cache needs.
+
+The count-based window (`keep_last_messages`) is **gone**, not merely
+unrecommended. It survived a while as a documented cap that nothing read, which
+is worse than either state: it looked adjustable and was not. It is not
+reinstated as a cap either, because a cap on the newest *N* messages slides the
+anchor the same way `recent()` did, as soon as a transcript of short messages
+outgrows *N* - which at 24 messages is most of them. A stored `keep_last_messages`
+in an old `config.json` is ignored rather than honoured, so nothing changes for
+an existing install.
 
 Real-model result on the live transcript, warm turns after the first:
 
@@ -933,12 +984,12 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-400 tests, about 29 seconds, no external network and no model needed. They
+431 tests, about 26 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor
 geometry, microphone selection, the no-tools fast path, the acknowledgement cue,
-and the prompt helpers.
+the HUD's state and its approval bridge, and the prompt helpers.
 The routing added for tool selection is covered the same way: keyword
 pre-loading, the memory-question patterns, and the evidence filter that stops a
 search result from counting the question itself or the model's own past wrong
@@ -1235,7 +1286,6 @@ Useful ones:
 | `warm_models` | `true` | Load the brain and prefill `[system, tools]` in the background at startup, so the first question does not pay the ~2.4 GB load (3.8–6.6s) and the ~92s cold schema prefill. Non-blocking; the first turn waits on it at worst |
 | `warm_vision` | `false` | Also load the vision models at startup, sequenced after the brain. Off because it pins ~4.2 GB for the few seconds of model load — it cannot cache a screenshot it has never seen, and the image prefill is the part that hurts |
 | `vlm_keep_alive` | `5m` | How long the vision models stay resident after a call. Short by default, because they are the largest thing loaded and the least often used; raise it toward `keep_alive` to make `warm_vision` survive a pause |
-| `keep_last_messages` | `24` | Cap on the replayed message count, independent of the budget below. It is not the window any more — the anchor in `history_char_budget` is. It exists only for a transcript of very short messages, where the character budget alone would not bind. **The most expensive setting here, and it looks free:** a newest-n window slides every turn, the token after the system prompt changes, and the whole history block becomes unreusable. Mean warm prefill: 62.4s at 40, 3.7s at 8, 0.7s at 0. Facts and notes reach the model through the cached system prompt, so the replay only buys anaphora — raise it only with a measurement |
 | `history_char_budget` | `3500` | Character budget for the replayed history. The window is **anchored and append-only**: `growing_window()` persists the oldest replayed message id in `prompt_state`, so the prompt prefix stays byte-identical turn to turn and the model reuses everything but the new exchange. It moves only when this budget is exceeded, then jumps back to `1 - history_trim_slack` of it. Warm prefill 9.78–17.01s → 4.14s, warm turn 19.08s → 12.67s. Capped low because the system prompt and 38 tool schemas are a measured ~4,100 tokens and `num_ctx` is 8,192; at 8,000 chars a tool turn reached 8,181 prompt tokens. `0` replays nothing, which costs all anaphora |
 | `history_trim_slack` | `0.4` | How far below `history_char_budget` a trim drops back to, as a fraction. Swept over 60 turns, counting only the characters re-prefilled *because the anchor moved*: 2,870/turn at 0.0, 835 at 0.25, **406 at 0.4**, 287 at 0.5, 85 at 0.8. 0.4 is the knee — past it the saving flattens while the window a trim leaves behind shrinks from 2,128 to 737 chars, and a short window costs anaphora. At 0.0 the anchor creeps forward one message per turn, which is the sliding window this replaced |
 | `num_predict` | `400` | Reply cap. Generation runs at 6.5–8.9 tok/s on CPU, so this is also the main lever on how long a turn feels: 400 tokens is ~50s |
@@ -1267,6 +1317,7 @@ than assuming it.
 | `tools/sight_tools.py` | Screen inspection and learning tools |
 | `vlm.py` | Vision model calls, output filtering, describe budget |
 | `approval.py` | Approval decisions: provenance, fingerprinting, expiry |
+| `hud.py` | The heads-up display: ring, telemetry, transcript, approval prompt |
 | `env.py` | Stops the project-root `pyautogui`/`mss` shims shadowing the real packages, and claims per-monitor DPI awareness before either loads |
 | `tools/` | 72 registered tools |
 | `jarvis_tests/fakes.py` | Loopback Home Assistant and MQTT servers for tests |

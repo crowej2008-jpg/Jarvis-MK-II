@@ -291,31 +291,31 @@ class Config:
 
     # --- Memory ----------------------------------------------------------
     db_path: str = ""  # blank -> <home>/memory.db
-    # How much raw conversation to replay to the model each turn, by message
-    # count. This is now a *cap* on top of history_char_budget, not the window
-    # itself, and the cap only binds on a transcript of very short messages.
-    #
-    # It was originally the window and the single most expensive setting in the
-    # app, set to 40 while looking like a free way to give the model more context.
-    # recent() takes the *newest* n, so the window slid on every turn and the
-    # token at position 1 changed. Ollama can only reuse a cached prompt when the
-    # new one starts with the same tokens, so a sliding window made the whole
-    # history block unreusable - only the system prompt and tool schemas, which
-    # are stable, stayed cached. Measured on real turns, mean warm prefill:
+    # There is deliberately no count-based history window here. There was one:
+    # keep_last_messages, which was the single largest latency bug in the app.
+    # It was the window itself, and because recent() takes the *newest* n, the
+    # window slid on every turn, so the token at position 1 changed and Ollama
+    # could reuse nothing but the system prompt and the tool schemas. Measured
+    # mean warm prefill on real turns:
     #
     #   keep_last_messages=40 -> 62.4s      (5,552 prompt tokens)
     #   keep_last_messages=8  ->  3.7s      (3,970)
     #   keep_last_messages=0  ->  0.7s      (3,916)
     #
-    # The end-to-end harness then showed the residual 9.78-17.01s, which is this
-    # same defect at a smaller size: the history block was still re-prefilled in
-    # full every turn, because it still slid.
+    # Lowering it was only a 1.2x fix, because the window still slid; the
+    # replacement was to persist the anchor (see history_char_budget). It used
+    # to survive here as a *cap* on top of that, documented but never read,
+    # which is the worst of both worlds: it looked adjustable and was not.
     #
-    # Durable knowledge does not live here. Facts, notes and visual memory all
-    # reach the model through the system prompt, which is stable and cached, so
-    # trimming the replay costs anaphora ("what about the second one?") and not
-    # the assistant's memory.
-    keep_last_messages: int = 24
+    # It is not reinstated as a cap because a cap on the newest N messages slides
+    # the anchor in exactly the same way, the moment a transcript of short
+    # messages outgrows N - which at 24 messages is most transcripts. The budget
+    # below is the only window, and it moves in deliberate chunks or not at all.
+    #
+    # Durable knowledge does not live in the replay. Facts, notes and visual
+    # memory all reach the model through the system prompt, which is stable and
+    # cached, so trimming the replay costs anaphora ("what about the second
+    # one?") and not the assistant's memory.
 
     # The replay is now append-only and bounded by characters rather than count,
     # so the prompt prefix stays byte-identical from one turn to the next and the

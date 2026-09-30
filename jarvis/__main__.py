@@ -1,9 +1,11 @@
 """Command line entry point.
 
     python -m jarvis                  voice mode with the wake word
-    python -m jarvis --text           type instead of talk
+    python -m jarvis --text           type instead of talking
+    python -m jarvis --hud            the heads-up display, type into it
     python -m jarvis "what's the time"   one question, then exit
     python -m jarvis --doctor         check the whole install
+
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("prompt", nargs="*", help="Ask one question and exit.")
     p.add_argument("--text", action="store_true", help="Type instead of talking.")
+    p.add_argument("--hud", action="store_true",
+                   help="Open the JARVIS heads-up display and type into it.")
     p.add_argument("--voice", action="store_true", help="Force voice mode.")
     p.add_argument("--no-wake", action="store_true", help="Disable the hotword.")
     p.add_argument("--no-speak", action="store_true", help="Do not speak replies.")
@@ -85,13 +89,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         return _run(cfg, prompt, text_mode=args.text, force_voice=args.voice,
-                    no_speak=args.no_speak)
+                    no_speak=args.no_speak, hud=args.hud)
     except KeyboardInterrupt:
         print("\n  offline.")
         return 130
 
 
-def _run(cfg, prompt: str, text_mode: bool, force_voice: bool, no_speak: bool) -> int:
+def _run(cfg, prompt: str, text_mode: bool, force_voice: bool, no_speak: bool,
+         hud: bool = False) -> int:
     from .assistant import Assistant
     from .brain import Brain, BrainUnavailable
     from .memory import Memory
@@ -134,11 +139,19 @@ def _run(cfg, prompt: str, text_mode: bool, force_voice: bool, no_speak: bool) -
     # first turn otherwise pays ~2.4 GB of weights plus ~92s of tool-schema
     # prefill, and neither depends on the question. Backgrounded so startup
     # itself stays about a second; the first turn waits on it at worst.
-    assistant.warm(on_done=lambda note: print(f"  warm: {note}", file=sys.stderr))
+    if not hud:
+        assistant.warm(on_done=lambda note: print(f"  warm: {note}", file=sys.stderr))
 
     # Everything past this point can raise or be interrupted, and the visual
     # memory holds an open SQLite connection that should not be leaked.
     try:
+        if hud:
+            # The display reports the warm into its own ring, so it is left to
+            # start it rather than being warmed twice from here.
+            from .hud import run_hud
+
+            return run_hud(assistant, speaker, echo=not no_speak, initial=prompt)
+
         if prompt:
             if text_mode:
                 from .cli import TextLoop

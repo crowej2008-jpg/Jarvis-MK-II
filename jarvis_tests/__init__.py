@@ -5726,5 +5726,427 @@ class TestStartupWarming(unittest.TestCase):
                          "two ~3 GB loads must not spike memory together")
 
 
+class TestHudState(unittest.TestCase):
+    """The display's own logic, with no display.
+
+    HudState is deliberately separated from the canvas so it can be exercised
+    here, where nothing may open a window or touch the real screen.
+    """
+
+    class FakeAssistant:
+        def __init__(self, line="model=qwen2.5:3b-instruct | tools=72", vision="qwen ready"):
+            self.line = line
+            self.vision = vision
+
+        def status_line(self):
+            return self.line
+
+        def vision_status(self):
+            return self.vision
+
+    class FakeCall:
+        def __init__(self, name, ok=True):
+            self.name = name
+            self.ok = ok
+
+    class FakeReply:
+        def __init__(self, text="done", error="", rounds=1, calls=()):
+            self.text = text
+            self.error = error
+            self.rounds = rounds
+            self.tool_calls = list(calls)
+
+    class FakeOutcome:
+        def __init__(self, reply, spoken=""):
+            self.reply = reply
+            self.spoken = spoken
+
+    def setUp(self):
+        from jarvis.hud import HudState
+
+        self.HudState = HudState
+        self.state = HudState(self.FakeAssistant())
+
+    def finish(self, text="done", error="", rounds=1, calls=(), elapsed=4.2):
+        outcome = self.FakeOutcome(self.FakeReply(text, error, rounds, calls))
+        self.state.finish_turn(outcome, elapsed)
+
+    # -- status and colour -------------------------------------------------
+    def test_it_starts_by_saying_it_is_warming(self):
+        from jarvis.hud import AMBER
+
+        snap = self.state.snapshot()
+        self.assertEqual(snap["status"], "warming")
+        self.assertEqual(snap["colour"], AMBER)
+
+    def test_colour_only_ever_means_a_state(self):
+        from jarvis.hud import (
+            AMBER, CYAN, DIM, GREEN, IDLE, RED, STATE_COLOUR, WHITE,
+        )
+
+        palette = {WHITE, DIM, IDLE, CYAN, AMBER, RED, GREEN}
+        self.assertTrue(STATE_COLOUR)
+        for status, colour in STATE_COLOUR.items():
+            self.assertIn(colour, palette,
+                          f"{status} draws in a colour that is not a state colour")
+        self.assertTrue(set(STATE_COLOUR.values()) <= palette)
+
+    def test_a_ready_display_is_not_drawn_in_the_same_grey_as_its_labels(self):
+        """Grey is the chrome: ticks, brackets, captions. If idle is that grey
+        too, a working assistant looks switched off."""
+        from jarvis.hud import DIM, STATE_COLOUR
+
+        self.assertNotEqual(STATE_COLOUR["idle"], DIM)
+        self.assertNotEqual(STATE_COLOUR["error"], STATE_COLOUR["idle"])
+
+    # -- a turn ------------------------------------------------------------
+    def test_beginning_a_turn_records_the_question_and_goes_busy(self):
+        self.state.begin_turn("what time is it")
+        snap = self.state.snapshot()
+        self.assertEqual(snap["status"], "thinking")
+        self.assertIn(("you", "what time is it"), snap["log"])
+        self.assertTrue(snap["turn"].running)
+
+    def test_tokens_accumulate_and_switch_to_streaming(self):
+        self.state.begin_turn("hi")
+        for piece in ("It ", "is ", "12:04"):
+            self.state.add_token(piece)
+        snap = self.state.snapshot()
+        self.assertEqual(snap["turn"].reply, "It is 12:04")
+        self.assertEqual(snap["status"], "streaming")
+
+    def test_a_token_arriving_with_no_turn_is_ignored(self):
+        """The stream callback can outlive a closed window, and it must not
+        crash the thread that delivered it."""
+        self.state.add_token("orphaned")
+        self.assertIsNone(self.state.snapshot()["turn"])
+
+    def test_finishing_records_the_reply_and_its_tools(self):
+        calls = [self.FakeCall("get_time"), self.FakeCall("speak", ok=False)]
+        self.finish("It is 12:04", rounds=2, calls=calls)
+        snap = self.state.snapshot()
+        self.assertFalse(snap["turn"].running)
+        self.assertEqual(snap["turn"].reply, "It is 12:04")
+        self.assertEqual(snap["turn"].rounds, 2)
+        self.assertEqual(snap["turn"].tools, [("get_time", True), ("speak", False)])
+        self.assertEqual(snap["turn"].elapsed, 4.2)
+        self.assertEqual(snap["status"], "idle")
+        self.assertIn(("jarvis", "It is 12:04"), snap["log"])
+
+    def test_a_failed_tool_is_kept_as_a_failure(self):
+        self.finish("sorry", calls=[self.FakeCall("kill_process", ok=False)])
+        kinds = [kind for kind, _ in self.state.snapshot()["log"]]
+        self.assertIn("failed", kinds,
+                      "a refused tool must not be logged as if it ran")
+
+    def test_a_brain_error_turns_the_display_red(self):
+        from jarvis.hud import RED
+
+        self.finish("", error="ollama refused the connection")
+        snap = self.state.snapshot()
+        self.assertEqual(snap["status"], "error")
+        self.assertEqual(snap["colour"], RED)
+        self.assertIn("refused", snap["turn"].error)
+
+    def test_an_raised_exception_is_shown_rather_than_swallowed(self):
+        self.state.begin_turn("do a thing")
+        self.state.fail_turn("BrainUnavailable: no model", 1.5)
+        snap = self.state.snapshot()
+        self.assertEqual(snap["status"], "error")
+        self.assertIn("no model", snap["turn"].error)
+        self.assertFalse(snap["turn"].running)
+
+    def test_a_turn_with_no_reply_still_returns_to_idle(self):
+        self.finish("")
+        self.assertEqual(self.state.snapshot()["status"], "idle")
+
+    def test_the_elapsed_gauge_counts_up_while_running_and_freezes_after(self):
+        from jarvis.hud import Turn
+
+        running = Turn(started=time.perf_counter())
+        first = running.live_elapsed()
+        time.sleep(0.05)
+        self.assertGreater(running.live_elapsed(), first,
+                           "the gauge has to move during a 90s prefill")
+        running.running = False
+        running.elapsed = 12.5
+        self.assertEqual(running.live_elapsed(), 12.5)
+
+    # -- what the window is allowed to see ---------------------------------
+    def test_the_snapshot_is_a_copy(self):
+        """The window mutates what it is handed; it must not be able to corrupt
+        the state a worker thread is still writing to."""
+        self.state.begin_turn("hi")
+        snap = self.state.snapshot()
+        snap["status"] = "error"
+        snap["turn"].reply = "tampered"
+        snap["turn"].running = False
+        snap["telemetry"].append(("forged", "yes"))
+        self.state.add_token("real")
+        after = self.state.snapshot()
+        self.assertEqual(after["turn"].reply, "real")
+        self.assertTrue(after["turn"].running)
+        self.assertNotIn(("forged", "yes"), after["telemetry"])
+        self.assertEqual(after["status"], "streaming",
+                         "the window's status write reached the state")
+
+    def test_telemetry_comes_from_the_assistants_own_summary(self):
+        rows = dict(self.state.snapshot()["telemetry"])
+        self.assertEqual(rows["model"], "qwen2.5:3b-instruct")
+        self.assertEqual(rows["tools"], "72")
+        self.assertEqual(rows["vision"], "qwen ready")
+
+    def test_a_telemetry_line_without_an_equals_is_kept_rather_than_crashing(self):
+        state = self.HudState(self.FakeAssistant(line="a model with no equals"))
+        rows = state.snapshot()["telemetry"]
+        self.assertTrue(all(len(row) == 2 for row in rows),
+                        "every telemetry row must be a label and a value")
+        self.assertIn("a model with no equals", [value for _, value in rows])
+
+    def test_a_broken_assistant_still_renders(self):
+        class Broken:
+            def status_line(self):
+                raise RuntimeError("no memory")
+
+            def vision_status(self):
+                raise RuntimeError("no vision")
+
+        rows = dict(self.HudState(Broken()).snapshot()["telemetry"])
+        self.assertIn("no memory", rows["model"])
+        self.assertIn("no vision", rows["vision"])
+
+    def test_warm_state_is_reported(self):
+        from jarvis.hud import GREEN
+
+        self.state.set_warm("done", "stub loaded")
+        snap = self.state.snapshot()
+        self.assertEqual(snap["warm"], "done")
+        self.assertEqual(snap["warm_note"], "stub loaded")
+        from jarvis.hud import _warm_colour
+
+        self.assertEqual(_warm_colour(snap), GREEN)
+
+
+class TestHudApprovalBridge(unittest.TestCase):
+    """The bridge between a turn thread and the thread that owns the window.
+
+    This is a safety component, so the case that matters most is the last one:
+    a window that goes away must refuse, not approve.
+    """
+
+    def setUp(self):
+        from jarvis.hud import ConfirmBridge
+
+        self.bridge = ConfirmBridge()
+
+    def test_a_request_waits_for_the_answer(self):
+        import threading
+
+        result = []
+
+        def worker():
+            result.append(self.bridge.ask("power_action", "shut down this machine"))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        request = self.bridge.pending()
+        self.assertIsNotNone(request)
+        tool, detail, answer = request
+        self.assertEqual(tool, "power_action")
+        self.assertIn("shut down", detail)
+        answer.put(True)
+        thread.join(5)
+        self.assertEqual(result, [True])
+
+    def test_a_refusal_comes_back_as_a_refusal(self):
+        import threading
+
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                self.bridge.ask("kill_process", "force-close notepad")
+            ),
+            daemon=True,
+        )
+        thread.start()
+        _, _, answer = self.bridge.pending()
+        answer.put(False)
+        thread.join(5)
+        self.assertEqual(result, [False])
+
+    def test_nothing_pending_means_no_request(self):
+        self.assertIsNone(self.bridge.pending())
+
+    def test_requests_are_taken_in_order(self):
+        import threading
+
+        # ask() blocks until answered, so both are queued by threads rather
+        # than raised here, and the window drains them in arrival order.
+        threading.Thread(target=self.bridge.ask, args=("a", "1"), daemon=True).start()
+        threading.Thread(target=self.bridge.ask, args=("b", "2"), daemon=True).start()
+        first = self.bridge.pending()
+        second = self.bridge.pending()
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual((first[0], second[0]), ("a", "b"))
+
+    def test_a_closed_window_refuses_rather_than_approving(self):
+        self.bridge.close()
+        self.assertFalse(self.bridge.ask("power_action", "shut down"),
+                         "a torn-down window must never be read as consent")
+
+
+class TestHistoryWindowSetting(unittest.TestCase):
+    """The count-based history window is gone, and must not come back.
+
+    It was the largest latency bug in the project, and it is tempting to
+    reinstate it as a "cap", because the character budget does not obviously
+    bound a transcript of very short messages. It would slide the anchor in
+    exactly the way that cost 62.4s, so the absence is the invariant.
+    """
+
+    def test_the_setting_is_not_on_the_config(self):
+        from jarvis.config import Config
+
+        self.assertFalse(
+            hasattr(Config(), "keep_last_messages"),
+            "a count-based window would slide the prompt anchor every turn",
+        )
+
+    def test_an_old_config_file_asking_for_it_is_ignored_not_honoured(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from jarvis.config import config_file, load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"keep_last_messages": 40,
+                                        "history_char_budget": 3500}),
+                            encoding="utf-8")
+            real = config_file
+            import jarvis.config as config_module
+
+            config_module.config_file = lambda: path
+            try:
+                cfg = load_config()
+            finally:
+                config_module.config_file = real
+        self.assertEqual(cfg.history_char_budget, 3500)
+        self.assertFalse(hasattr(cfg, "keep_last_messages"),
+                         "a stored value must not reappear as a live setting")
+
+    def test_the_replayed_window_is_anchored_and_never_a_newest_n(self):
+        """The actual mechanism: the replay grows from a stored anchor."""
+        import inspect
+        import textwrap
+
+        from jarvis import brain
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(brain.Brain._messages)))
+        self.assertIn("growing_window", ast.dump(tree))
+        # An actual call, not the word in the comment explaining why not. The
+        # sliding window is a one-line change that costs 62.4s a turn.
+        called = {node.func.attr for node in ast.walk(tree)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        self.assertNotIn("recent", called)
+        self.assertIn("growing_window", called)
+
+
+class TestHudBoundaries(unittest.TestCase):
+    """The display is a window onto the assistant, not a second assistant.
+
+    These are structural checks on the source, because the failure they guard
+    against is a change nobody would make on purpose: a UI that starts running
+    tools itself, or quietly turns the approval gate off.
+    """
+
+    def source(self):
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parent.parent / "jarvis" / "hud.py"
+        return ast.parse(path.read_text(encoding="utf-8"))
+
+    def test_it_never_calls_a_tool_itself(self):
+        """Everything it shows came from a turn. A direct registry call here
+        would be a tool running with nobody having asked a question."""
+        tree = self.source()
+        called = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                called.add(node.func.attr)
+        for forbidden in ("call", "call_checked", "dispatch", "run_tool", "invoke"):
+            self.assertNotIn(
+                forbidden, called,
+                f"hud.py calls .{forbidden}(); tools must only run via a turn",
+            )
+
+    def test_it_installs_the_approval_gate_rather_than_bypassing_it(self):
+        import inspect
+        import textwrap
+
+        from jarvis.hud import HudWindow
+
+        body = ast.dump(ast.parse(textwrap.dedent(
+            inspect.getsource(HudWindow.__init__))))
+        self.assertIn("set_approver", body,
+                      "a window with no approver makes every dangerous tool fail")
+
+    def test_it_never_disables_confirmation(self):
+        source = Path(__file__).resolve().parent.parent / "jarvis" / "hud.py"
+        text = source.read_text(encoding="utf-8")
+        for forbidden in ("confirm_destructive", "set_auto_approve",
+                          "auto_approve", "trust("):
+            self.assertNotIn(
+                forbidden, text,
+                f"hud.py mentions {forbidden!r}; the gate is the assistant's to hold",
+            )
+
+    def test_tk_is_imported_lazily_so_the_state_module_needs_no_display(self):
+        """A machine with no display, or a test runner, must still be able to
+        import jarvis.hud and use HudState."""
+        tree = self.source()
+        top_level = [node for node in tree.body
+                     if isinstance(node, (ast.Import, ast.ImportFrom))]
+        for node in top_level:
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else []
+            module = getattr(node, "module", "") or ""
+            self.assertNotIn("tkinter", module)
+            self.assertFalse(any(n.startswith("tkinter") for n in names))
+
+    def test_everything_redrawn_each_frame_is_tagged(self):
+        """The frame loop deletes one tag and redraws. An untagged item would
+        survive every frame and the window would grow without bound at 30Hz."""
+        from jarvis.hud import FRAME, FRAME_TAG
+
+        self.assertEqual(FRAME_TAG, {"tags": (FRAME,)})
+        tree = self.source()
+        checked = 0
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.FunctionDef) and node.name.startswith("_draw")):
+                continue
+            for inner in ast.walk(node):
+                if not (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr.startswith("create_")):
+                    continue
+                checked += 1
+                named = {kw.arg for kw in inner.keywords if kw.arg}
+                unpacked = {kw.value.id for kw in inner.keywords
+                            if kw.arg is None and isinstance(kw.value, ast.Name)}
+                self.assertTrue(
+                    "tags" in named or "FRAME_TAG" in unpacked,
+                    f"{node.name} draws a {inner.func.attr} with no FRAME tag",
+                )
+        self.assertGreater(checked, 15, "the scan found almost nothing to check")
+
+    def test_the_display_is_offered_on_the_command_line(self):
+        from jarvis import __main__ as entry
+
+        flags = {a.dest for a in entry.build_parser()._actions}
+        self.assertIn("hud", flags)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
