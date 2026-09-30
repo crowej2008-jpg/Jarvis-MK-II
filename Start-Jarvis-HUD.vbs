@@ -72,7 +72,7 @@ WScript.Quit rc
 ' Newest Python first. Folder names like "Python313" and "Python39" do not sort
 ' correctly as strings, so the version digit is parsed and compared numerically.
 Function FindPythonw()
-  Dim root, subf, candidate, best, digits, rev
+  Dim root, subf, cand, candidate, best, digits, rev
   FindPythonw = ""
   rev = 0
   best = ""
