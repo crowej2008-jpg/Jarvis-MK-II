@@ -150,12 +150,27 @@ class Config:
     # --- Autonomy --------------------------------------------------------
     # Act without asking inside these apps. Anything else prompts first, and a
     # one-off approval is remembered so it stops asking.
+    #
+    # HD-Player is BlueStacks, and it is here for game and app automation. Read
+    # the residual risk before trusting it: allowlisting a browser trusts the
+    # *browser*, which is why the dangerous-title check exists - Chrome sitting
+    # on a bank's login page is caught by the title. Allowlisting an emulator
+    # trusts every Android app inside it, and BlueStacks does not put the Android
+    # app's name in the Windows title bar, so the dangerous-*title* check has
+    # less to work with. What still applies is the dangerous *class* check (UAC,
+    # CredentialUIBroker, Logonui, Consent) and the credential-context check,
+    # which reads the actual pixels and refuses typing anywhere near Password,
+    # PIN, Security code or API key - the same protection Chrome gets.
+    #
+    # So: safe for games and ordinary apps. Remove this line if the emulator
+    # holds anything you would not want clicked unattended.
     autonomy_allowlist: list[str] = field(
         default_factory=lambda: [
             "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
             "notepad.exe", "notepad++.exe", "explorer.exe", "code.exe",
             "calc.exe", "mspaint.exe", "cmd.exe", "powershell.exe", "wt.exe",
             "wordpad.exe", "outlook.exe",
+            "hd-player.exe",
         ]
     )
     autonomy_denylist: list[str] = field(
@@ -288,6 +303,28 @@ class Config:
     act_settle_s: float = 0.6
     # Reject clicks outside this inset from the screen edge.
     screen_edge_margin: int = 2
+
+    # --- Emulator game channel -------------------------------------------
+    # A separate ADB channel, used only by the game_* tools. It exists because
+    # the desktop path cannot read the game: the emulator renders it small
+    # inside a desktop-sized window and OCR over a desktop capture returns zero
+    # characters, while the device's own frame is sharp. See jarvis/game_link.py,
+    # which also documents why the frame is 900x1600 while `wm size` claims
+    # 1600x900, and why the screencap coordinates are the tap coordinates.
+    #
+    # The serial is pinned rather than discovered on every call. Auto-detection
+    # is kept as the fallback for a blank setting, but the default names an
+    # emulator explicitly so this channel cannot start driving a physical phone
+    # because one happened to be plugged in.
+    game_device: str = "emulator-5554"
+    # Blank uses BlueStacks' own HD-Adb.exe, then adb from PATH.
+    game_adb: str = ""
+    # Blank uses whatever pytesseract finds. Tesseract is not on PATH here, so
+    # the install JARVIS already relies on for game OCR is named outright.
+    game_tesseract: str = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    # Per-adb-call ceiling. A capture is a couple of seconds; this exists to
+    # turn a wedged emulator into a message instead of a hung turn.
+    game_timeout: float = 20.0
 
     # --- Memory ----------------------------------------------------------
     db_path: str = ""  # blank -> <home>/memory.db

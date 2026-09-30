@@ -5726,6 +5726,61 @@ class TestStartupWarming(unittest.TestCase):
                          "two ~3 GB loads must not spike memory together")
 
 
+class TestEmulatorTrust(unittest.TestCase):
+    """BlueStacks is trusted for automation, and the guards around it must hold.
+
+    Allowlisting a browser trusts the browser, which is why the dangerous-title
+    check exists. Allowlisting an emulator trusts every app inside it, and
+    BlueStacks does not surface the Android app name in the Windows title bar,
+    so the check that has less to work with is the title one. The credential and
+    dangerous-class checks are the protection left, and these pin them.
+    """
+
+    def test_the_emulator_is_trusted_for_game_automation(self):
+        d = Autonomy(make_config(autonomy_allowlist=["hd-player.exe"])).evaluate(
+            app="HD-Player.exe", window_title="BlueStacks"
+        )
+        self.assertTrue(d.allowed, "the emulator has to be hands-free to be usable")
+        self.assertFalse(d.needs_approval)
+        self.assertFalse(d.blocked)
+
+    def test_an_unrelated_app_is_still_gated(self):
+        """Trusting the emulator is not trust in general."""
+        a = Autonomy(make_config(autonomy_allowlist=["hd-player.exe"]))
+        d = a.evaluate(app="someothergame.exe", window_title="A Game")
+        self.assertFalse(d.allowed)
+        self.assertTrue(d.needs_approval)
+        self.assertFalse(d.blocked, "an unknown app is gated, not blocked")
+
+    def test_typing_near_a_credential_inside_the_emulator_is_refused(self):
+        """The pixel-level check is what still protects an emulator, so it has to
+        hold there and not only in a browser."""
+        d = Autonomy(make_config(autonomy_allowlist=["hd-player.exe"])).evaluate(
+            app="HD-Player.exe",
+            window_title="BlueStacks",
+            elements=[{"text": "Password"}],
+            action="type",
+        )
+        self.assertFalse(d.allowed)
+        self.assertTrue(d.blocked)
+
+    def test_privileged_classes_still_win_inside_the_emulator(self):
+        for title in DANGEROUS_CLASSES:
+            d = Autonomy(make_config(autonomy_allowlist=["hd-player.exe"])).evaluate(
+                app="HD-Player.exe", window_title=title
+            )
+            self.assertTrue(d.blocked, f"{title} must stay blocked")
+
+    def test_the_denylist_outranks_the_emulator_grant(self):
+        """An emulator that somehow ends up on the denylist must lose, or the
+        grant would be a way around it."""
+        a = Autonomy(make_config(autonomy_allowlist=["hd-player.exe"],
+                                  autonomy_denylist=["hd-player.exe"]))
+        self.assertFalse(a.trusted("HD-Player.exe"))
+        self.assertTrue(a.evaluate(app="HD-Player.exe",
+                                   window_title="BlueStacks").blocked)
+
+
 class TestHudState(unittest.TestCase):
     """The display's own logic, with no display.
 
@@ -6146,6 +6201,340 @@ class TestHudBoundaries(unittest.TestCase):
 
         flags = {a.dest for a in entry.build_parser()._actions}
         self.assertIn("hud", flags)
+
+
+class FakeAdb:
+    """Stands in for the adb binary so game-channel tests never touch a device.
+
+    Records every argv it is handed and replies from canned output, which is
+    what lets the coordinate rules be tested properly: the point of these tests
+    is that a tap is built and bounds-checked correctly, not that a real phone
+    gets tapped.
+    """
+
+    def __init__(self, devices=("emulator-5554",), out=None, frame=(900, 1600)):
+        self.devices = list(devices)
+        self.out = out or ""
+        self.frame = frame
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd, *rest, **kwargs):
+        argv = [str(c) for c in cmd]
+        self.calls.append(argv)
+        joined = " ".join(argv)
+
+        class Result:
+            def __init__(self, stdout, returncode=0):
+                self.stdout = stdout
+                self.stderr = b""
+                self.returncode = returncode
+
+        if "devices" in argv:
+            body = "List of devices attached\n"
+            body += "".join(f"{d}\tdevice\n" for d in self.devices)
+            return Result(body.encode())
+        if "screencap" in joined:
+            width, height = self.frame
+            import cv2
+
+            ok, buf = cv2.imencode(".png", np.zeros((height, width, 3), np.uint8))
+            assert ok
+            return Result(buf.tobytes())
+        if "dumpsys" in argv and "displays" in argv:
+            return Result(
+                f"  init={self.frame[1]}x{self.frame[0]} 240dpi "
+                f"cur={self.frame[0]}x{self.frame[1]} app={self.frame[0]}x{self.frame[1]}\n".encode()
+            )
+        return Result(self.out.encode())
+
+
+def make_game_link(fake, **kw):
+    from jarvis.game_link import GameLink
+
+    link = GameLink(**kw)
+    link._adb_path = "fake-adb"
+    link._run = lambda *args, binary=False: (
+        fake(list(args)) if binary else fake(list(args)).stdout.decode(errors="ignore")
+    )
+    link.connected = lambda: list(fake.devices)
+    return link
+
+
+class TestGameChannelCoordinates(unittest.TestCase):
+    """The frame is 900x1600 while `wm size` reports 1600x900. Pins that the
+    tools use captured coordinates, not `wm size`, and never both."""
+
+    def test_tap_uses_frame_coordinates_directly(self):
+        fake = FakeAdb()
+        link = make_game_link(fake)
+        self.assertEqual(link.tap(450, 800), (450, 800))
+        self.assertIn(
+            ["shell", "input", "tap", "450", "800"],
+            fake.calls,
+            "a tap must reach the device unchanged: the screencap frame and the "
+            "input display are the same space",
+        )
+
+    def test_a_tap_outside_the_frame_is_refused_and_says_why(self):
+        link = make_game_link(FakeAdb())
+        for bad in ((950, 40), (-1, 10), (10, 1700), (900, 10), (10, 1600)):
+            with self.assertRaises(Exception) as caught:
+                link.tap(*bad)
+            self.assertIn("900x1600", str(caught.exception))
+        # A refused tap must not have reached the device at all: clamping to the
+        # edge in a game is an unpredictable action, not a no-op.
+        self.assertEqual(link.connected(), ["emulator-5554"])
+
+    def test_the_refusal_names_the_coordinate_space(self):
+        link = make_game_link(FakeAdb())
+        with self.assertRaises(Exception) as caught:
+            link.tap(2000, 2000)
+        self.assertIn("frame pixels", str(caught.exception))
+
+    def test_swipe_builds_a_drag(self):
+        fake = FakeAdb()
+        link = make_game_link(fake)
+        self.assertEqual(link.swipe(450, 1200, 450, 400, 250), (450, 1200, 450, 400, 250))
+        self.assertIn(["shell", "input", "swipe", "450", "1200", "450", "400", "250"],
+                      fake.calls)
+
+    def test_swipe_endpoints_are_both_bounds_checked(self):
+        link = make_game_link(FakeAdb())
+        with self.assertRaises(Exception):
+            link.swipe(10, 10, 900, 10)
+        with self.assertRaises(Exception):
+            link.swipe(10, 10, 10, 9999)
+
+    def test_keys_are_normalised_to_android_names(self):
+        fake = FakeAdb()
+        link = make_game_link(fake)
+        self.assertEqual(link.key("back"), "KEYCODE_BACK")
+        self.assertIn(["shell", "input", "keyevent", "KEYCODE_BACK"], fake.calls)
+        # An already-correct keycode must not be doubled up into
+        # KEYCODE_KEYCODE_BACK.
+        self.assertEqual(link.key("KEYCODE_HOME"), "KEYCODE_HOME")
+        link.key("HOME")
+        self.assertIn(["shell", "input", "keyevent", "KEYCODE_HOME"], fake.calls)
+
+
+class TestGameChannelDevicePin(unittest.TestCase):
+    def test_the_default_names_an_emulator_so_a_phone_is_not_picked_up(self):
+        from jarvis.config import load_config
+
+        self.assertTrue(
+            load_config().game_device.startswith("emulator-"),
+            "auto-detected devices would let a plugged-in phone be driven; the "
+            "serial has to be pinned to an emulator by default",
+        )
+
+    def test_a_pinned_serial_is_never_overridden_by_what_is_connected(self):
+        link = make_game_link(FakeAdb(devices=["emulator-5554", "R58M1234"]))
+        self.assertEqual(link.resolve_device(), "emulator-5554")
+
+    def test_auto_detection_still_prefers_an_emulator_when_unpinned(self):
+        fake = FakeAdb(devices=["R58M1234", "emulator-5556"])
+        link = make_game_link(fake, device="")
+        self.assertEqual(link.resolve_device(), "emulator-5556")
+
+    def test_no_device_is_an_error_rather_than_a_guess(self):
+        link = make_game_link(FakeAdb(devices=[]), device="")
+        with self.assertRaises(Exception) as caught:
+            link.resolve_device()
+        self.assertIn("no emulator", str(caught.exception))
+
+
+class TestGameChannelGeometry(unittest.TestCase):
+    def test_geometry_prefers_the_current_display_over_the_panel_size(self):
+        fake = FakeAdb(frame=(900, 1600))
+        link = make_game_link(fake)
+        self.assertEqual(link.geometry()["frame"], (900, 1600))
+
+    def test_wm_size_is_never_called(self):
+        """`wm size` prints init=, the panel as manufactured. If it were ever
+        consulted the frame would come back 1600x900 and every tap would be
+        addressed to the wrong space."""
+        source = Path(__file__).resolve().parent.parent / "jarvis" / "game_link.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        checked = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            words = [a.value for a in node.args
+                     if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+            if not words:
+                continue
+            checked += 1
+            self.assertFalse(
+                "wm" in words and "size" in words,
+                f"wm size was passed to a call: {words!r}",
+            )
+        self.assertGreater(checked, 4, "the scan found almost nothing to check")
+
+
+class TestGameChannelIsolation(unittest.TestCase):
+    """The channel must not reach the desktop, and the desktop must not reach
+    the channel. Either leak turns a click into a phone tap or a tap into a
+    click somewhere on the real screen."""
+
+    def test_the_game_channel_does_not_import_the_local_shims(self):
+        source = Path(__file__).resolve().parent.parent / "jarvis" / "game_link.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertNotIn("mss", imported)
+        self.assertNotIn("pyautogui", imported)
+        self.assertNotIn("bs_env", imported,
+                         "bs_env lives at the repo root next to the shims; the "
+                         "channel has to stand on its own")
+
+    def test_the_game_channel_is_wired_into_the_assistant(self):
+        source = Path(__file__).resolve().parent.parent / "jarvis" / "assistant.py"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("game_tools.bind", text)
+
+    def test_the_game_tools_are_registered_with_valid_schemas(self):
+        load_all()
+        names = {t.name for t in registry._tools.values()}
+        for tool in ("game_screen_text", "game_state", "game_tap", "game_swipe",
+                     "game_press_key", "game_bot"):
+            self.assertIn(tool, names)
+        for tool in registry._tools.values():
+            if tool.name.startswith("game_"):
+                self.assertEqual(tool.parameters.get("type"), "object")
+
+    def test_game_tap_is_not_marked_destructive(self):
+        """It is confirmed by the user's standing choice, not per call."""
+        load_all()
+        self.assertFalse(registry._tools["game_tap"].dangerous)
+
+    def test_the_emulator_stays_trusted_but_not_denied_on_the_desktop(self):
+        """Adding the emulator for desktop automation must not have made it a
+        blanket bypass anywhere else."""
+        from jarvis.autonomy import Autonomy as RealAutonomy
+
+        a = RealAutonomy(make_config(autonomy_allowlist=["hd-player.exe"],
+                                     autonomy_denylist=["1password.exe"]))
+        self.assertTrue(a.trusted("HD-Player.exe"))
+        self.assertFalse(a.trusted("1password.exe"))
+
+
+class TestGameBotControl(unittest.TestCase):
+    def setUp(self):
+        from jarvis.tools import game_tools
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.paths = {
+            "root": root,
+            "bot": root / "hoopas_vault_bot.py",
+            "running": root / "bot_running.flag",
+            "stop": root / "stop_bot.flag",
+            "stats": root / "bot_stats.txt",
+            "screen": root / "_hv_screen.png",
+            "log": root / "bot.log",
+        }
+        self.bot = root / "hoopas_vault_bot.py"
+        self.bot.write_text("import sys, time\nprint('bot up')\n"
+                            "time.sleep(2)\n", encoding="utf-8")
+        self._real = game_tools.bot_paths
+        game_tools.bot_paths = lambda: self.paths
+        self._link = make_game_link(FakeAdb())
+        game_tools._state["link"] = self._link
+        game_tools._state["children"] = []
+        self.tools = game_tools
+
+    def tearDown(self):
+        self.tools.bot_paths = self._real
+        for proc in self.tools._state.get("children", []):
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def test_status_reports_idle_cleanly(self):
+        out = self.tools.game_bot("status")
+        self.assertFalse(out["running"])
+        self.assertIsNone(out["pid"])
+
+    def test_stop_while_idle_does_not_invent_a_stop_file(self):
+        out = self.tools.game_bot("stop")
+        self.assertFalse(out["stopped"])
+        self.assertFalse(self.paths["stop"].exists())
+
+    def test_stop_asks_via_the_flag_the_bot_already_polls(self):
+        self.paths["running"].write_text("on", encoding="utf-8")
+        out = self.tools.game_bot("stop")
+        self.assertTrue(out["stopped"])
+        self.assertTrue(self.paths["stop"].exists(),
+                        "the bot polls stop_bot.flag between steps, so that is "
+                        "how a stop has to be delivered")
+
+    def test_start_launches_the_bot_with_auto_and_refuses_a_second_run(self):
+        out = self.tools.game_bot("start")
+        self.assertTrue(out["started"])
+        self.assertEqual(out["pid"], self.tools._state["children"][-1].pid)
+        proc = self.tools._state["children"][-1]
+        proc.wait(timeout=20)
+        self.assertIn("bot up", self.paths["log"].read_text(encoding="utf-8"))
+
+        self.paths["running"].write_text("on", encoding="utf-8")
+        again = self.tools.game_bot("start")
+        self.assertFalse(again["started"], "a second start would fight the first")
+
+    def test_sweep_is_passed_through(self):
+        proc_argv = []
+        real_popen = self.tools.subprocess.Popen
+
+        class Spy(real_popen):
+            def __init__(self, argv, *a, **k):
+                proc_argv.extend(argv)
+                super().__init__(argv, *a, **k)
+
+        self.tools.subprocess.Popen = Spy
+        try:
+            self.tools.game_bot("start", sweep=True)
+        finally:
+            self.tools.subprocess.Popen = real_popen
+        self.assertIn("--sweep", proc_argv)
+        self.assertIn("--auto", proc_argv)
+
+    def test_start_clears_a_stale_stop_flag(self):
+        """Otherwise the new run reads the old flag and exits at once."""
+        self.paths["stop"].write_text("stop", encoding="utf-8")
+        self.tools.game_bot("start")
+        self.assertFalse(self.paths["stop"].exists())
+
+    def test_start_without_an_emulator_is_refused_not_launched(self):
+        offline = make_game_link(FakeAdb(devices=[]))
+        self.tools._state["link"] = offline
+        offline.online = lambda: False
+        with self.assertRaises(ToolError):
+            self.tools.game_bot("start")
+        self.assertEqual(self.tools._state["children"], [])
+
+    def test_log_before_any_run_says_so(self):
+        self.assertIn("not been started", self.tools.game_bot("log")["log"])
+
+    def test_an_unknown_action_is_a_tool_error(self):
+        with self.assertRaises(ToolError):
+            self.tools.game_bot("levitate")
+
+    def test_the_paths_are_where_the_bot_actually_keeps_its_files(self):
+        """The bot hard-codes these names next to its own script; bot control
+        would silently do nothing if they drifted apart."""
+        self.tools.bot_paths = self._real
+        real = self._real()
+        bot_src = Path(real["bot"]).read_text(encoding="utf-8")
+        self.assertIn('"stop_bot.flag"', bot_src)
+        self.assertIn('"bot_running.flag"', bot_src)
+        self.assertEqual(real["bot"].parent, real["stop"].parent)
+        self.assertEqual(real["bot"].parent, real["running"].parent)
 
 
 if __name__ == "__main__":

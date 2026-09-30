@@ -23,7 +23,8 @@ from .locator import Locator
 from .perception import Perception
 from .vision_memory import VisionMemory
 from .vlm import Vision
-from .tools import iot_tools, load_all, memory_tools, mouse_tools, sight_tools, system_tools
+from .tools import (game_tools, iot_tools, load_all, memory_tools, mouse_tools,
+                     sight_tools, system_tools)
 
 log = logging.getLogger("jarvis.assistant")
 
@@ -85,6 +86,11 @@ class Assistant:
 
         sight_tools.bind(cfg, self.vision_memory, memory, self.autonomy)
         mouse_tools.bind(cfg, self.vision_memory, self.autonomy, self.locator)
+        # The emulator channel is separate from the desktop one on purpose: it
+        # never reaches the screen, so it is not bound to the desktop locator or
+        # vision memory, and it does not consult Autonomy. See game_tools for why
+        # that asymmetry is the user's explicit choice.
+        game_tools.bind(cfg, self.autonomy)
         system_tools.set_approver(self._confirm)
         # With confirmation switched off, decisions are auto-granted. Saying so
         # up front keeps them distinguishable from a person answering yes.

@@ -407,6 +407,7 @@ TOOL_MODULES = (
     "web_tools",
     "sight_tools",
     "mouse_tools",
+    "game_tools",
 )
 
 

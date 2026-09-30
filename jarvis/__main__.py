@@ -416,6 +416,27 @@ def _doctor(cfg) -> int:
     except Exception as exc:  # noqa: BLE001
         check("screenshot", False, str(exc)[:90])
 
+    # The emulator channel is optional and its absence is not a failure: most
+    # sessions never touch a game. Reported as a note so a closed emulator does
+    # not read like a broken install.
+    print("\n  emulator")
+    try:
+        from .game_link import bot_paths, build_from_config
+
+        link = build_from_config(cfg)
+        devices = link.connected()
+        if not devices:
+            print(f"  [--] no emulator connected (pinned to {cfg.game_device})")
+        else:
+            pinned = link.resolve_device()
+            frame = link.geometry()["frame"]
+            app = link.focused_app() or "unknown"
+            check("adb", True, f"{link.adb_path().rsplit(chr(92), 1)[-1]} -> {pinned}")
+            check("game frame", True, f"{frame[0]}x{frame[1]} device pixels (tap space)")
+            check("foreground", True, f"{app} | bot playing: {bot_paths()['running'].exists()}")
+    except Exception as exc:  # noqa: BLE001
+        check("adb", False, str(exc)[:90])
+
     print("\n  seeing")
     try:
         from .perception import Perception

@@ -14,8 +14,10 @@ reads the screen, and a local voice does the mouth. No cloud services.
   observation.
 - **Remembers** — conversation, facts, notes, learned UI coordinates, successful
   procedures, and per-app habits.
-  - **72 tools** across screen, files, web, system, memory, home automation, and
-    MQTT. All 72 are registered, and the 10 most relevant to what you just said
+- **78 tools** across screen, files, web, system, memory, home automation,
+  MQTT, and the emulator game channel. All 78 are registered, and the 10 most
+  relevant to what you just said
+
     are sent each turn, with `list_more_tools` always offered as a way back to
     the rest.
 
@@ -398,7 +400,7 @@ the part that has to stay. The remaining 8,000 is JSON structure that vanishes
 only if tools are removed, which the table above shows is a bad trade.
 
 **So the tools are chosen per turn instead of cut from the list.**
-`Brain.select_tools()` scores all 72 registered tools against the utterance — a
+`Brain.select_tools()` scores all 78 registered tools against the utterance — a
 category keyword from the tool's tags is worth most, a word of its own name next,
 and a description word least, because descriptions share vocabulary with each
 other and a single common word means nothing — and sends the best `tool_select_max`
@@ -984,7 +986,7 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-431 tests, about 26 seconds, no external network and no model needed. They
+463 tests, about 34 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor
@@ -1237,6 +1239,23 @@ actual database. That is deliberate: the failures worth guarding against here
 are the ones where JARVIS types into the wrong window, and a test that clicks
 something is no use as a guard.
 
+The emulator channel is held to the same rule. Its tests substitute a fake `adb`
+that records argv and answers from canned output, which is what makes the
+coordinate rules testable at all: that a tap is built as
+`input tap 450 800`, that both swipe endpoints are bounds-checked, that a
+coordinate outside the frame is refused rather than clamped to the edge, that a
+key like `back` becomes `KEYCODE_BACK` and an already-correct `KEYCODE_HOME` is
+not doubled into `KEYCODE_KEYCODE_HOME`, and that a pinned serial is never
+overridden by whatever happens to be connected. No test taps a real device.
+
+Two of those are static checks rather than behavioural ones, and deliberately
+so. One asserts `game_link.py` imports neither `mss` nor `pyautogui` nor
+`bs_env`, by walking the AST — the channel standing on its own is what stops a
+desktop click from ever becoming a phone tap. The other asserts the string pair
+`"wm", "size"` is never passed to a call, because that command reports `init=`
+and would silently reintroduce the 1600x900 panel size into a 900x1600 tap
+space.
+
 It has already earned its keep. Writing it turned up a crash in the nested
 screenshot path, two dangerous window titles that were not being blocked, and
 argument coercion that mangled list arguments a model sends as JSON strings.
@@ -1289,12 +1308,101 @@ Useful ones:
 | `history_char_budget` | `3500` | Character budget for the replayed history. The window is **anchored and append-only**: `growing_window()` persists the oldest replayed message id in `prompt_state`, so the prompt prefix stays byte-identical turn to turn and the model reuses everything but the new exchange. It moves only when this budget is exceeded, then jumps back to `1 - history_trim_slack` of it. Warm prefill 9.78–17.01s → 4.14s, warm turn 19.08s → 12.67s. Capped low because the system prompt and 38 tool schemas are a measured ~4,100 tokens and `num_ctx` is 8,192; at 8,000 chars a tool turn reached 8,181 prompt tokens. `0` replays nothing, which costs all anaphora |
 | `history_trim_slack` | `0.4` | How far below `history_char_budget` a trim drops back to, as a fraction. Swept over 60 turns, counting only the characters re-prefilled *because the anchor moved*: 2,870/turn at 0.0, 835 at 0.25, **406 at 0.4**, 287 at 0.5, 85 at 0.8. 0.4 is the knee — past it the saving flattens while the window a trim leaves behind shrinks from 2,128 to 737 chars, and a short window costs anaphora. At 0.0 the anchor creeps forward one message per turn, which is the sliding window this replaced |
 | `num_predict` | `400` | Reply cap. Generation runs at 6.5–8.9 tok/s on CPU, so this is also the main lever on how long a turn feels: 400 tokens is ~50s |
-| `tool_select_max` | `0` | How many tools, chosen by relevance to the utterance, reach the prompt per turn. All 72 stay registered; this only narrows what is shown. `0`, the default, sends every core tool every turn, which keeps the prompt byte-identical so the cache keeps hitting. **Leave it at 0:** raising it cuts the cold turn from 68s to 45s but costs 15–40s on every *new* question, which is the common case. It does improve routing, 20/20 requests finding their tool against 13/20, so it is worth revisiting on hardware with faster prefill |
+| `tool_select_max` | `0` | How many tools, chosen by relevance to the utterance, reach the prompt per turn. All 78 stay registered; this only narrows what is shown. `0`, the default, sends every core tool every turn, which keeps the prompt byte-identical so the cache keeps hitting. **Leave it at 0:** raising it cuts the cold turn from 68s to 45s but costs 15–40s on every *new* question, which is the common case. It does improve routing, 20/20 requests finding their tool against 13/20, so it is worth revisiting on hardware with faster prefill |
 | `fast_path` | `true` | Ask questions that show no sign of wanting a tool without attaching any tool schemas. Worth about an order of magnitude: 0.39–1.69s to first output against 7.65–8.97s with the 38-tool block. The gate is lopsided towards the tools on purpose, and a refusal from a no-tools answer is retried properly rather than returned. `false` always sends the tools |
 | `acknowledge_sound` | `tick` | Short tone played once the transcript exists, before thinking starts, so a 15–30s wait does not feel broken. Queued in under 2ms and reaching the ear in ~183ms, the difference being the output device's ~182ms buffer. `""` disables it; `chime`, `blip` and `soft` also work. The output stream is opened and primed at startup, because opening it costs ~200ms and the driver's first write a further ~220ms |
 | `confirm_destructive` | `true` | Ask before dangerous tools. `--confirmation` overrides per run |
-| `autonomy_allowlist` | see config | Apps trusted by default |
+| `autonomy_allowlist` | see config | Apps trusted by default. Includes `hd-player.exe`, the BlueStacks emulator, for game and app automation |
 | `autonomy_denylist` | see config | Never touch, cannot be overridden |
+| `game_device` | `emulator-5554` | Serial the game channel addresses. **Pinned rather than auto-detected**, so a plugged-in physical phone can never be picked up by accident; an empty value falls back to auto-detection, which still prefers `emulator-*` |
+| `game_adb` | `""` | Path to `adb`. Blank finds BlueStacks' `HD-Adb.exe`, then `adb` on `PATH` |
+| `game_tesseract` | `C:\Program Files\Tesseract-OCR\tesseract.exe` | Tesseract for reading the game screen. Named outright because it is not on `PATH` on this machine |
+| `game_timeout` | `20.0` | Per-`adb`-call ceiling, so a wedged emulator becomes a message instead of a hung turn |
+
+## Playing the game on the emulator
+
+Six `game_*` tools drive the emulator over ADB. They are a **separate channel
+from the desktop tools**, because the desktop tools cannot see the game at all.
+
+Measured on this machine, same screen, same moment:
+
+| | desktop capture | ADB screencap |
+|---|---|---|
+| frame | 1920x1200 | **900x1600** |
+| OCR result | **0 characters** | reads the game |
+
+The emulator renders the game small inside a desktop-sized window, and text that
+size is below what Tesseract copes with, so reading the desktop returns nothing.
+The device's own framebuffer frame is sharp. Vision is not the answer either: an
+unseen `qwen2.5vl:3b` frame costs 68–90s of prefill, which is useless as a
+per-move feedback loop. So a full read-plus-act cycle is **~2.7s** (1.94s
+capture, 0.78s OCR), about 22 observations a minute.
+
+### Coordinates: read `cur=`, not `wm size`
+
+`screencap` returns 900x1600 portrait while `wm size` reports
+`Physical size: 1600x900`. That looks like a rotation bug and is not:
+
+```
+adb shell dumpsys window displays
+    init=1600x900  cur=900x1600  app=900x1600
+```
+
+`init` is the panel as manufactured; `cur` is what it is turned to right now.
+`input tap` addresses the **current** display, which is why a captured
+coordinate *is* the coordinate to tap and no transform exists anywhere in this
+path. `wm size` reports `init=` and is the single most misleading command in the
+channel — a test pins that it is never called.
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `game_state` | Connection, frame size, foreground app, whether the bot is playing |
+| `game_screen_text` | OCR one fresh frame (~2.7s). `psm` defaults to `11`, for labels scattered over artwork |
+| `game_tap` | Tap, in frame pixels. Out-of-frame coordinates are refused, never clamped |
+| `game_swipe` | Drag, for scrolling and dragging |
+| `game_press_key` | `back`, `home`, `enter`, `menu`, `power`, `volup`, `voldown`, `backspace` |
+| `game_bot` | `status` / `start` / `stop` / `log` for the Hoopa's Vault bot |
+
+### Why these do not ask for approval
+
+Desktop actuation is checked against `Autonomy` on every click, because a click
+can land on anything, including a bank. ADB input can only address one pinned
+emulator: it cannot reach the desktop, another window's keyboard, or any file.
+There is no desktop credential surface in the channel to check, so prompting
+per action would be ceremony around a fixed, narrow target.
+
+This is a deliberate, recorded decision, not an oversight. What it does **not**
+give up: the desktop `Autonomy` layer is untouched, the root shims stay
+bypassed, and the emulator is trusted on the desktop without being denied
+anywhere. `game_state` always reports the serial, so a wrong device is visible
+rather than assumed.
+
+Note the residual risk on the desktop side: allowlisting a browser trusts the
+*browser*, which is why the dangerous-title check exists — Chrome on a bank's
+login page is caught by the title. Allowlisting an emulator trusts every app
+inside it, and BlueStacks does not put the Android app's name in the Windows
+title bar, so the title check has less to work with. The dangerous-*class* check
+and the credential-context check still apply, and both are tested against the
+emulator specifically.
+
+### The bot
+
+`hoopas_vault_bot.py` (Pokémon UNITE, 1153 lines) already supports being driven
+from outside, so nothing in it was modified:
+
+- `--auto` skips the interactive menu
+- `bot_running.flag` appears while it plays
+- writing `stop_bot.flag` tells it to stop at the next safe point in its loop
+- `bot_stats.txt` and `~/.jarvis/hoopa_bot.log` hold the output
+
+It runs as a **child process**, deliberately. It puts the repository root on
+`sys.path` so it picks up the local `mss.py`/`pyautogui.py` shims — which is
+exactly what it needs and exactly what JARVIS must never see, so the two are kept
+in separate processes.
+
+`--sweep` makes it repeat the current floor forever instead of climbing.
 
 ## Notes on this machine
 
@@ -1319,5 +1427,8 @@ than assuming it.
 | `approval.py` | Approval decisions: provenance, fingerprinting, expiry |
 | `hud.py` | The heads-up display: ring, telemetry, transcript, approval prompt |
 | `env.py` | Stops the project-root `pyautogui`/`mss` shims shadowing the real packages, and claims per-monitor DPI awareness before either loads |
-| `tools/` | 72 registered tools |
+| `mouse.py` | Desktop pointer motion, humanised |
+| `game_link.py` | The emulator's ADB channel: capture, tap, swipe, keys. Separate from the desktop path on purpose, and it never touches the root shims |
+| `tools/game_tools.py` | `game_*` tools plus start/stop/status/log for the Hoopa's Vault bot |
+| `tools/` | 78 registered tools |
 | `jarvis_tests/fakes.py` | Loopback Home Assistant and MQTT servers for tests |
