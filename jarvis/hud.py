@@ -123,6 +123,10 @@ class HudState:
         self.status = "warming"
         self.warm = "pending"
         self.warm_note = ""
+        # Microphone, when one is open. `level` is the live input level, which
+        # is the only honest way to show "listening" - a still window and an
+        # open mic look identical.
+        self.mic = {"listening": False, "level": 0.0, "wake": "off", "stt": None}
         self.turn: Turn | None = None
         self.log: list[tuple[str, str]] = []
         self.started = time.perf_counter()
@@ -166,6 +170,14 @@ class HudState:
         with self._lock:
             self.warm = warm
             self.warm_note = note
+
+    def set_mic(self, **changes: Any) -> None:
+        with self._lock:
+            self.mic.update(changes)
+
+    def set_level(self, level: float) -> None:
+        with self._lock:
+            self.mic["level"] = max(0.0, min(1.0, level))
 
     def note(self, text: str, kind: str = "system") -> None:
         with self._lock:
