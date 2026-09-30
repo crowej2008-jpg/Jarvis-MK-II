@@ -17,7 +17,20 @@ if (-not (Test-Path -LiteralPath $wscript)) {
     Write-Error "wscript.exe not found"
 }
 
-$desktop = [Environment]::GetFolderPath("Desktop")
+# Resolve the Desktop the way Explorer does. On a OneDrive-backed account the
+# registry value is the real Desktop (C:\Users\<you>\OneDrive\Desktop) while
+# [Environment]::GetFolderPath can hand back the bare C:\Users\<you>\Desktop,
+# which on this machine does not exist at all. A shortcut saved into a path that
+# is not there is a shortcut that quietly did not get created, so the registry
+# wins and the result is verified before this claims success.
+$desktop = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders").Desktop
+if ([string]::IsNullOrWhiteSpace($desktop)) {
+    $desktop = [Environment]::GetFolderPath("Desktop")
+}
+if (-not (Test-Path -LiteralPath $desktop)) {
+    New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+}
+
 $lnkPath = Join-Path $desktop "JARVIS - HUD.lnk"
 
 $shell = New-Object -ComObject WScript.Shell
@@ -27,5 +40,9 @@ $lnk.Arguments = "`"$vbs`""
 $lnk.WorkingDirectory = $PSScriptRoot
 $lnk.Description = "Start the JARVIS heads-up display (microphone on)"
 $lnk.Save()
+
+if (-not (Test-Path -LiteralPath $lnkPath)) {
+    Write-Error "Saved the shortcut but it is not at $lnkPath; check the Desktop path."
+}
 
 Write-Host "Created $lnkPath"
