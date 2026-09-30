@@ -49,6 +49,7 @@ Unconfigured optional integrations report `SKIP`, not `FAIL`.
 python -m jarvis              # voice, with wake word
 python -m jarvis --text       # type instead
 python -m jarvis --hud        # the heads-up display, type into it
+python -m jarvis --hud --voice  # the display plus the microphone in it
 python -m jarvis --no-wake    # voice, push to talk
 python -m jarvis "what time is it"   # one-shot, then exit
 python -m jarvis --tools      # list every tool
@@ -56,6 +57,18 @@ python -m jarvis --show-config
 python -m jarvis --list-audio # input devices, to pick a microphone
 python -m jarvis --device 7   # use a specific microphone
 ```
+
+### The double-clickable launcher
+
+`--hud --voice` from a terminal is the stepping-stone; the thing to double-click is
+`Start-Jarvis-HUD.vbs`, which opens the display with the microphone already on
+and **no console window behind it**. It runs the app under `pythonw.exe`, and
+because `pythonw` swallows everything, the launcher redirects the app's output to
+`%USERPROFILE%\.jarvis\hud-launch.log` and puts the tail of that log in a message
+box if the app exits with a failure - a launcher that fails quietly is worse than
+no launcher. Run `make-shortcut.ps1` once to put a `JARVIS - HUD` shortcut for it
+on the Desktop. `start-hud.cmd` is the debugging alternative: it keeps a console
+open so tracebacks stay visible while you work on it.
 
 ### The heads-up display
 
@@ -91,6 +104,17 @@ destructive tool still cannot run without a person clicking through - and becaus
 the turn runs on a worker thread while the question blocks for up to `request_timeout`,
 the confirmation is marshalled onto the window's own thread, and a window that
 has gone away refuses rather than approves.
+
+With `--voice` the microphone lives in the display: the telemetry column shows
+the live input level as a bar, the wake word when it hears it, and "ears" while
+it is transcribing. A spoken question goes through exactly the same
+`HudWindow.submit` path as a typed one - same worker thread, same busy guard,
+same approval prompt, same speaking indicator - so a dangerous tool still needs
+a person to click through. Without a wake word installed, pressing Enter in the
+empty box is the "talk to me" key; with one, "hey JARVIS" opens the mic, and
+saying it again interrupts a reply mid-sentence. A missing hotword is a note,
+not a failure: the display stays microphone-capable, and a machine with no
+microphone still gets a working HUD.
 
 The layout is measured rather than assumed: line heights and character widths
 come from the font metrics, because Tk scales by DPI and this display runs at

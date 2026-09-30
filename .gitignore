@@ -21,6 +21,12 @@
 !/README.md
 !/requirements.txt
 
+# The launchers are part of the project, so they ship with it. The Desktop
+# shortcut they create lives outside the repo and stays local.
+!/Start-Jarvis-HUD.vbs
+!/start-hud.cmd
+!/make-shortcut.ps1
+
 # ...but never the build/runtime noise, which lives inside those directories too.
 # These come last so they win over the re-include rules above.
 __pycache__/

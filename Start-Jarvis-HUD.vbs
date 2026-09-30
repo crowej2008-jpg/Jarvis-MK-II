@@ -1,0 +1,129 @@
+' Launch the JARVIS heads-up display with no console window behind it.
+'
+' WHY THIS IS A .VBS AND NOT A .BAT
+' ---------------------------------
+' The display is a GUI. Under pythonw.exe there is no console, which is the
+' point, but it also means a traceback goes nowhere at all: a bad config, a
+' missing tkinter, an Ollama that never started would all look identical to
+' the user, namely a window that never appears. So this launcher runs the app
+' with its output redirected to a log, and if the process exits with a failure
+' it reads the tail of that log and puts it in a message box. A launcher that
+' fails quietly is worse than no launcher.
+'
+' Usage: Start-Jarvis-HUD.vbs          normal, keyboard and microphone
+'        Start-Jarvis-HUD.vbs text     keyboard only
+
+Option Explicit
+
+Dim fso, shell, base, logPath, logDir, pythonw, cmd, rc, tail
+
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+
+base = fso.GetParentFolderName(WScript.ScriptFullName)
+logDir = shell.ExpandEnvironmentStrings("%USERPROFILE%\.jarvis")
+If Not fso.FolderExists(logDir) Then
+  fso.CreateFolder logDir
+End If
+logPath = logDir & "\hud-launch.log"
+
+pythonw = FindPythonw()
+If pythonw = "" Then
+  MsgBox "Could not find pythonw.exe." & vbCrLf & vbCrLf & _
+         "JARVIS needs Python installed. Try running:" & vbCrLf & _
+         "    python -m jarvis --hud --voice", vbCritical, "JARVIS"
+  WScript.Quit 1
+End If
+
+' --hud for the display, --voice to open the microphone in it. Extra arguments
+' are passed through, so "text" above runs it keyboard only.
+Dim args, i, extra
+args = ""
+If WScript.Arguments.Count > 0 Then
+  For i = 0 To WScript.Arguments.Count - 1
+    args = args & " " & WScript.Arguments(i)
+  Next
+End If
+
+' Start marker so the log can be trimmed to just this run's output; without it
+' the tail below could quote an error from an earlier session.
+Dim marker
+marker = "=== run " & Now & " ==="
+Dim log
+Set log = fso.OpenTextFile(logPath, 8, True)
+log.WriteLine marker
+log.Close
+
+' Window style 0 is "hidden". Going through cmd is what makes the redirection
+' possible; pythonw cannot redirect its own output on Windows.
+cmd = "cmd /c ""cd /d """ & base & """ && """ & pythonw & """ -m jarvis --hud --voice" & args & " >> """ & logPath & """ 2>&1"""
+
+rc = shell.Run(cmd, 0, True)
+
+If rc <> 0 Then
+  tail = ReadTail(logPath, 1400)
+  MsgBox "JARVIS stopped with exit code " & rc & "." & vbCrLf & vbCrLf & _
+         "Log tail:" & vbCrLf & tail & vbCrLf & vbCrLf & _
+         "Full log: " & logPath, vbCritical, "JARVIS"
+End If
+
+WScript.Quit rc
+
+' Newest Python first. Folder names like "Python313" and "Python39" do not sort
+' correctly as strings, so the version digit is parsed and compared numerically.
+Function FindPythonw()
+  Dim root, subf, candidate, best, digits, rev
+  FindPythonw = ""
+  rev = 0
+  best = ""
+  root = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%\Programs\Python")
+  If Not fso.FolderExists(root) Then
+    root = ""
+  End If
+  Do While True
+    Dim folder
+    folder = root
+    If root = "" Then
+      ' Nothing under %LOCALAPPDATA%; try a PATH lookup once instead.
+      Set subf = shell.Exec("cmd /c where pythonw.exe 2>nul")
+      If subf Is Nothing Or Err.Number <> 0 Then Exit Do
+      Dim out
+      out = Trim(subf.StdOut.ReadAll)
+      If out = "" Then Exit Do
+      FindPythonw = Split(out, vbCrLf)(0)
+      Exit Do
+    End If
+    For Each cand In fso.GetFolder(folder).SubFolders
+      candidate = cand.Path & "\pythonw.exe"
+      If fso.FileExists(candidate) Then
+        digits = cand.Name
+        Dim i
+        i = InStrRev(cand.Name, "Python")
+        If i > 0 Then digits = Mid(cand.Name, i + 6)
+        digits = Replace(digits, "-", ".")
+        If IsNumeric(digits) And CDbl(digits) > rev Then
+          rev = CDbl(digits)
+          best = candidate
+        End If
+      End If
+    Next
+    Exit Do
+  Loop
+  If best <> "" Then FindPythonw = best
+End Function
+
+Function ReadTail(path, maxChars)
+  Dim text
+  If Not fso.FileExists(path) Then
+    ReadTail = "(no log was written)"
+    Exit Function
+  End If
+  Dim f
+  Set f = fso.OpenTextFile(path, 1)
+  text = f.ReadAll
+  f.Close
+  If Len(text) > maxChars Then
+    text = "..." & Right(text, maxChars)
+  End If
+  ReadTail = text
+End Function

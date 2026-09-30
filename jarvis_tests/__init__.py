@@ -6051,6 +6051,296 @@ class TestHudApprovalBridge(unittest.TestCase):
                          "a torn-down window must never be read as consent")
 
 
+class TestHudVoice(unittest.TestCase):
+    """The microphone driven from the display.
+
+    HudVoice must never be a second turn path: a spoken question has to reach
+    the same worker, busy guard, approval bridge and speaking indicator as a
+    typed one. The cases here use fakes for everything outside the loop, which
+    is the only way to test it without opening a microphone.
+    """
+
+    class FakeAssistant:
+        def status_line(self):
+            return "model=test | tools=0"
+
+        def vision_status(self):
+            return "vision off"
+
+    class FakeMic:
+        def __init__(self):
+            self.started = False
+            self.stopped = False
+            self.listeners = []
+            self.rms = 0.05
+            self.utterance = "hey jarvis what time is it"
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+        def add_listener(self, fn):
+            self.listeners.append(fn)
+
+        def remove_listener(self, fn):
+            if fn in self.listeners:
+                self.listeners.remove(fn)
+
+        def level(self, after_seq=0):
+            return self.rms, 0
+
+        def record_utterance(self, timeout_s=15.0, on_start=None):
+            return self.utterance
+
+    class FakeListener:
+        def __init__(self, text="what time is it", elapsed=1.2):
+            from jarvis.stt import Transcript
+
+            self.transcript = Transcript(text=text, elapsed=elapsed)
+            self.warmed = False
+
+        def warm_up(self):
+            self.warmed = True
+
+        def transcribe(self, audio):
+            return self.transcript
+
+    class FakeWake:
+        def __init__(self):
+            self.loaded = False
+            self.callback = None
+            self.reset_count = 0
+
+        def load(self):
+            self.loaded = True
+
+        def on_wake(self, fn):
+            self.callback = fn
+
+        def feed(self, chunk):
+            pass
+
+        def reset(self):
+            self.reset_count += 1
+
+    class Window:
+        """The only parts of HudWindow the loop is allowed to touch."""
+
+        def __init__(self):
+            self.submitted = []
+            self.done = False
+            self.busy_flag = False
+            self._closing = False
+
+        def submit(self, text, on_done=None):
+            self.submitted.append(text)
+            if on_done is not None:
+                on_done(self.outcome)
+
+        def busy(self):
+            return self.busy_flag
+
+    class Outcome:
+        def __init__(self, text="done", spoken="done", action=""):
+            self.text = text
+            self.spoken = spoken
+            self.reply = text
+            self.action = action
+
+    def make(self, wake=None, wake_enabled=True):
+        import threading
+
+        from jarvis.hud import HudState, HudVoice
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            wake_enabled=wake_enabled,
+            wake_model="hey_jarvis",
+            wake_threshold=0.5,
+            sample_rate=16000,
+            acknowledge_sound="",  # quiet: no tone playback in tests
+        )
+        state = HudState(self.FakeAssistant())
+        mic = self.FakeMic()
+        listener = self.FakeListener()
+        window = self.Window()
+        window.outcome = self.Outcome()
+        voice = HudVoice(
+            self.FakeAssistant(), cfg, state, window, listener, mic,
+            wake=wake, speaker=None,
+        )
+        return voice, state, mic, listener, window
+
+    def test_a_wake_feed_sets_the_event_and_reports_the_score(self):
+        from jarvis.hud import HudVoice
+
+        voice, state, mic, listener, window = self.make(wake=self.FakeWake())
+        voice._install_wake()
+        wake = voice.wake
+        self.assertEqual(wake.reset_count, 0)
+        wake.callback(0.87)
+        snap = state.snapshot()
+        self.assertEqual(snap["mic"]["wake"], "0.87")
+        self.assertTrue(voice._wake_event.is_set())
+
+    def test_a_missing_wake_word_is_a_note_not_a_failure(self):
+        voice, state, mic, listener, window = self.make(wake=None)
+        self.assertFalse(voice._install_wake())
+        snap = state.snapshot()
+        self.assertEqual(snap["mic"]["wake"], "off")
+
+    def test_a_failed_wake_load_keeps_the_microphone_working(self):
+        class Broken(self.FakeWake):
+            def load(self):
+                raise RuntimeError("no model file")
+
+        voice, state, mic, listener, window = self.make(wake=Broken())
+        self.assertFalse(voice._install_wake())
+        self.assertIsNone(voice.wake, "a broken hotword must not block speech")
+        snap = state.snapshot()
+        self.assertIn("no model file", " ".join(n for _, n in snap["log"]))
+
+    def test_a_spoken_turn_goes_through_the_same_submit_path(self):
+        voice, state, mic, listener, window = self.make(wake=self.FakeWake())
+        voice._install_wake()
+        try:
+            voice._run_turn()
+            self.assertEqual(window.submitted, ["what time is it"])
+            # The microphone stays open across turns; only shutdown closes it.
+            self.assertFalse(mic.stopped)
+            self.assertEqual(voice.wake.reset_count, 1)
+            # The turn's "you" line is begin_turn's job, done by the shared
+            # window.submit path; _run_turn contributes the timing note.
+            self.assertIn("transcribed in 1.2s",
+                          " ".join(n for _, n in state.snapshot()["log"]))
+        finally:
+            voice.shutdown()
+
+    def test_speaking_goes_to_the_window_worker_not_this_thread(self):
+        """submit() may be synchronous in this fake, but the real one is not,
+        and the loop must wait for the turn before hearing again."""
+        voice, state, mic, listener, window = self.make(wake=None)
+        calls = []
+        window.submit = lambda text, on_done=None: calls.append(text)
+        try:
+            voice._run_turn()
+            self.assertEqual(calls, ["what time is it"])
+        finally:
+            voice.shutdown()
+
+    def test_sleep_stops_listening_for_the_next_hotword(self):
+        from jarvis.hud import HudVoice
+
+        voice, state, mic, listener, window = self.make(wake=self.FakeWake())
+        window.outcome = self.Outcome(action="sleep")
+        voice._install_wake()
+        voice._asleep = False
+        try:
+            voice._run_turn()
+            self.assertTrue(voice._asleep)
+            snap = state.snapshot()
+            self.assertIn("asleep", " ".join(n for _, n in snap["log"]))
+        finally:
+            voice.shutdown()
+
+    def test_silence_is_reported_and_the_mic_stays_open(self):
+        class Silent(self.FakeMic):
+            def record_utterance(self, timeout_s=15.0, on_start=None):
+                raise TimeoutError("nothing said")
+
+        voice, state, mic, listener, window = self.make(wake=None)
+        voice.mic = Silent()
+        try:
+            voice._run_turn()
+            snap = state.snapshot()
+            self.assertEqual(window.submitted, [])
+            self.assertIn("didn't catch", " ".join(n for _, n in snap["log"]))
+        finally:
+            voice.shutdown()
+
+    def test_level_pushes_into_the_state_as_a_fraction(self):
+        import threading
+
+        voice, state, mic, listener, window = self.make(wake=None)
+        t = threading.Thread(target=voice._level, daemon=True)
+        t.start()
+        try:
+            deadline = time.time() + 3
+            frac = 0.0
+            while time.time() < deadline:
+                frac = state.snapshot()["mic"]["level"]
+                if frac > 0.0:
+                    break
+                time.sleep(0.02)
+        finally:
+            voice._stop.set()
+            t.join(3)
+        self.assertGreater(frac, 0.0)
+        self.assertLessEqual(frac, 1.0)
+
+    def test_reporting_a_level_uses_the_same_db_scale_as_the_console(self):
+        """The HUD meter and the console meter must agree on what "loud" means,
+        or the same voice will look strong in one front end and weak in the
+        other."""
+        from jarvis.hud import level_fraction
+
+        mic_rms = 0.02
+        # Recomputed by hand against voice.py's _level_meter mapping.
+        import math
+
+        peak = max(mic_rms, 1e-6)
+        db = 20 * math.log10(peak)
+        expected = max(0.0, min(1.0, (db + 55.0) / 55.0))
+        self.assertAlmostEqual(level_fraction(mic_rms), expected, places=6)
+        self.assertGreaterEqual(level_fraction(0.0), 0.0)
+        self.assertLessEqual(level_fraction(10.0), 1.0)
+
+    def test_run_waits_for_the_keyboard_when_there_is_no_wake_word(self):
+        """Without a hotword the loop idles until the window's Enter key asks
+        for voice, which is the request_speak() the window calls."""
+        import threading
+
+        voice, state, mic, listener, window = self.make(wake=None)
+        window.outcome = self.Outcome(action="")
+        voices = []
+        orig = voice._run_turn
+        voice._run_turn = lambda: (voices.append(1) or orig())
+        t = threading.Thread(target=voice.run, daemon=True)
+        t.start()
+        # Let the loop reach the idle wait, then trigger a speaker request.
+        tries = 0
+        while tries < 50:
+            if state.snapshot()["mic"].get("wake") == "off":
+                break
+            time.sleep(0.02)
+            tries += 1
+        time.sleep(0.1)
+        voice.request_speak()
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if voices:
+                break
+            time.sleep(0.02)
+        voice.shutdown()
+        t.join(3)
+        self.assertTrue(voices, "a spoken request must run a turn")
+        self.assertEqual(window.submitted, ["what time is it"])
+
+    def test_run_reports_a_missing_microphone_without_dying(self):
+        class NoMic(self.FakeMic):
+            def start(self):
+                raise RuntimeError("no input device")
+
+        voice, state, mic, listener, window = self.make(wake=None)
+        voice.mic = NoMic()
+        voice.run()
+        snap = state.snapshot()
+        self.assertIn("microphone unavailable", " ".join(n for _, n in snap["log"]))
+        self.assertEqual(snap["mic"]["listening"], False)
+
+
 class TestHistoryWindowSetting(unittest.TestCase):
     """The count-based history window is gone, and must not come back.
 

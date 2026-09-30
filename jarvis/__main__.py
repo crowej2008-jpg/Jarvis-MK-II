@@ -30,7 +30,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", action="store_true", help="Type instead of talking.")
     p.add_argument("--hud", action="store_true",
                    help="Open the JARVIS heads-up display and type into it.")
-    p.add_argument("--voice", action="store_true", help="Force voice mode.")
+    p.add_argument("--voice", action="store_true",
+                   help="Force voice mode. With --hud this also opens the "
+                        "microphone in the display.")
     p.add_argument("--no-wake", action="store_true", help="Disable the hotword.")
     p.add_argument("--no-speak", action="store_true", help="Do not speak replies.")
     p.add_argument("--doctor", action="store_true", help="Check the install and exit.")
@@ -150,7 +152,8 @@ def _run(cfg, prompt: str, text_mode: bool, force_voice: bool, no_speak: bool,
             # start it rather than being warmed twice from here.
             from .hud import run_hud
 
-            return run_hud(assistant, speaker, echo=not no_speak, initial=prompt)
+            return run_hud(assistant, speaker, echo=not no_speak, initial=prompt,
+                           voice=force_voice)
 
         if prompt:
             if text_mode:
