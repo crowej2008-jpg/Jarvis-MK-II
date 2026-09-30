@@ -6341,6 +6341,139 @@ class TestHudVoice(unittest.TestCase):
         self.assertEqual(snap["mic"]["listening"], False)
 
 
+class TestHudTranscriptScroll(unittest.TestCase):
+    """The transcript is a window onto the log, not the tail of it.
+
+    The reader has to be able to scroll back without the log growing, and the
+    wheel has to stop at the ends rather than running off into nothing. These
+    cases drive the real slicing with the drawing stubbed, because the maths is
+    the part that can be wrong; the canvas calls are not.
+    """
+
+    class Event:
+        def __init__(self, delta):
+            self.delta = delta
+
+    class Canvas:
+        def __init__(self):
+            self.texts = []
+
+        def create_text(self, x, y, **kw):
+            self.texts.append(kw.get("text", ""))
+
+    def make(self, total=40, visible=9):
+        from jarvis.hud import HudWindow
+
+        window = HudWindow.__new__(HudWindow)
+        window._scroll = 0
+        window.MAX_TRANSCRIPT_LINES = visible
+        window.char_w = 8
+        window.line_h = 18
+        window.canvas = self.Canvas()
+        window._geometry = lambda w, h: {"floor": 100}
+        window.f_label = None
+        window.f_body = None
+        # Fixed size so the visible count is predictable: (660 - 34 - 100) / 18.
+        return window, [f"line {n}" for n in range(total)]
+
+    def drawn(self, window, lines):
+        """The lines the draw actually put on the canvas, in order."""
+        import textwrap
+
+        from jarvis.hud import HudWindow
+
+        window.canvas.texts.clear()
+        rows = [("jarvis", line) for line in lines]
+        saved = textwrap.wrap
+        try:
+            # One row per line, so the wrap maths cannot change the counts.
+            textwrap.wrap = lambda text, width=None, **kw: [text]
+            HudWindow._draw_transcript(window, 960, 660,
+                                       {"colour": "white", "log": list(rows)})
+        finally:
+            textwrap.wrap = saved
+        return [t for t in window.canvas.texts if t in set(lines)]
+
+    def test_the_tail_is_the_default_view(self):
+        window, lines = self.make()
+        self.assertEqual(self.drawn(window, lines), lines[-9:])
+
+    def test_scrolling_back_walks_the_log_upwards(self):
+        window, lines = self.make()
+        window._on_wheel(self.Event(120))
+        self.assertEqual(window._scroll, 3)
+        self.assertEqual(self.drawn(window, lines), lines[-12:-3])
+
+    def test_a_new_turn_snaps_back_to_the_live_tail(self):
+        window, lines = self.make()
+        window._on_wheel(self.Event(120))
+        self.assertEqual(window._scroll, 3)
+
+        class FakeState:
+            def begin_turn(self, *_a):
+                pass
+
+            def add_token(self, *_a):
+                pass
+
+            def finish_turn(self, *_a):
+                pass
+
+            def note(self, *_a):
+                pass
+
+        class FakeOutcome:
+            text = "ok"
+            spoken = "ok"
+
+        class FakeAssistant:
+            def respond(self, *_a, **_k):
+                return self.outcome
+
+        window.state = FakeState()
+        window.assistant = FakeAssistant()
+        window.assistant.outcome = FakeOutcome()
+        window.speaker = None
+        window.echo = False
+        window._worker = None
+        window.submit("hello")
+        self.assertEqual(window._scroll, 0,
+                         "a reply must never land while the reader is scrolled up")
+        window._worker.join(5)
+
+    def test_scrolling_stops_at_the_top_of_the_log(self):
+        window, lines = self.make()
+        for _ in range(50):
+            window._on_wheel(self.Event(120))
+        self.assertGreater(window._scroll, 0)
+        self.drawn(window, lines)  # the draw is what clamps
+        self.assertEqual(window._scroll, 40 - 9)
+        self.assertEqual(self.drawn(window, lines), lines[:9])
+
+    def test_scrolling_down_returns_to_the_tail(self):
+        window, lines = self.make()
+        for _ in range(20):
+            window._on_wheel(self.Event(120))
+        for _ in range(40):
+            window._on_wheel(self.Event(-120))
+        self.assertEqual(window._scroll, 0)
+        self.assertEqual(self.drawn(window, lines), lines[-9:])
+
+    def test_a_short_log_cannot_be_scrolled_at_all(self):
+        window, lines = self.make(total=4)
+        for _ in range(10):
+            window._on_wheel(self.Event(120))
+        self.drawn(window, lines)
+        self.assertEqual(window._scroll, 0)
+        self.assertEqual(self.drawn(window, lines), lines)
+
+    def test_a_scrolled_view_says_so(self):
+        window, lines = self.make()
+        window._on_wheel(self.Event(120))
+        self.drawn(window, lines)
+        self.assertIn("-3 more", window.canvas.texts)
+
+
 class TestHistoryWindowSetting(unittest.TestCase):
     """The count-based history window is gone, and must not come back.
 

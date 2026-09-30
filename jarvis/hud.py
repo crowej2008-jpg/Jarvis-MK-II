@@ -329,6 +329,10 @@ class HudWindow:
         self._worker: threading.Thread | None = None
         self._closing = False
         self._clock = 0.0
+        # How many wrapped lines the view is held back from the newest one. Zero
+        # is the live tail, which is where the view sits by default and returns to
+        # whenever a new turn arrives.
+        self._scroll = 0
 
         self.root = tk.Tk()
         self.root.title("JARVIS")
@@ -365,6 +369,14 @@ class HudWindow:
         self.entry.bind("<Escape>", lambda _e: self.close())
         self.entry.place(relx=0.06, rely=0.955, relwidth=0.88, height=30)
         self.entry.focus_set()
+
+        # Bound on the root rather than the canvas because the entry holds focus
+        # for typing, and a wheel event on a canvas that does not have focus never
+        # reaches it. One log, so the wheel scrolls the log wherever the pointer
+        # is, instead of silently eating the event.
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
+        self.root.bind_all("<Button-4>", lambda e: self._on_wheel(e, up=True))
+        self.root.bind_all("<Button-5>", lambda e: self._on_wheel(e, up=False))
 
         # The approval gate, wired exactly as the text front end wires it.
         self.assistant.set_approver(self.bridge.ask)
@@ -407,6 +419,25 @@ class HudWindow:
         self.submit(text)
         return "break"
 
+    def _on_wheel(self, event: Any, up: bool | None = None) -> str:
+        """Hold the transcript still while the reader scrolls back through it.
+
+        Windows delivers the wheel as a <MouseWheel> event whose delta is a
+        multiple of 120, so the step is normalised away rather than trusted, and
+        one notch is always exactly one line. Buttons 4 and 5 are the Linux
+        equivalents and are bound separately.
+
+        The clamp happens in the draw, not here, because the number of lines
+        that can be scrolled depends on the window height and on how much text
+        is in the log; this only asks to move and lets the draw say no.
+        """
+        if up is None:
+            up = int(getattr(event, "delta", 0)) > 0
+        # Up walks back towards the start of the log, so it grows the distance
+        # from the tail. Down closes that distance back down to zero.
+        self._scroll = max(0, self._scroll + (3 if up else -3))
+        return "break"
+
     def submit(self, text: str, on_done: Any = None) -> None:
         """Start a turn on a worker thread, so the display keeps moving.
 
@@ -419,6 +450,9 @@ class HudWindow:
         if self._worker is not None and self._worker.is_alive():
             self.state.note("busy: still working on the last one", "failed")
             return
+        # A new turn snaps the view back to the live tail. Staying put while
+        # scrolled would mean the reply lands off-screen and looks lost.
+        self._scroll = 0
         self.state.begin_turn(text)
 
         def on_token(piece: str) -> None:
@@ -722,7 +756,16 @@ class HudWindow:
         room = int((h - 34 - floor) / self.line_h)
         if room < 1:
             return
-        lines = lines[-min(room, self.MAX_TRANSCRIPT_LINES):]
+        # A fixed window of lines, anchored on the tail by default. When the
+        # reader has scrolled back the window slides up by that many lines, so
+        # the same amount of text stays on screen and the log does not resize
+        # while you read it.
+        visible = min(room, self.MAX_TRANSCRIPT_LINES)
+        reach = max(0, len(lines) - visible)
+        if self._scroll > reach:
+            self._scroll = reach
+        end = len(lines) - self._scroll
+        lines = lines[max(0, end - visible):end]
 
         y = h - 34 - len(lines) * self.line_h
         for kind, line, ink in lines:
@@ -733,6 +776,13 @@ class HudWindow:
             c.create_text(w * 0.14, y, anchor="w", text=line, fill=ink,
                           font=self.f_body, **FRAME_TAG)
             y += self.line_h
+
+        if self._scroll:
+            # Without this the log looks frozen while it is actually held back,
+            # which reads as a hang rather than as a scroll.
+            c.create_text(w * 0.94, y - len(lines) * self.line_h - 6,
+                          anchor="ne", text=f"-{self._scroll} more",
+                          fill=DIM, font=self.f_label, **FRAME_TAG)
 
     # -- small helpers -----------------------------------------------------
 

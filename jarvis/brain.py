@@ -38,8 +38,10 @@ password or payment field, and you should not try to work around that."""
 # does not change the front of the prompt. See Brain.clock_note. This line is
 # fixed text and does not vary, so it costs nothing in cache terms.
 CLOCK_GUIDANCE = """The current date and time arrive with the user's message in \
-brackets. Use that rather than guessing. If it is missing or you need the exact \
-time, call what_time_is_it."""
+brackets. Use that rather than guessing, but only when the answer needs it. If it \
+is missing or you need the exact time, call what_time_is_it. Never open a reply \
+with the time, and never state the time unless the user actually asked for it: \
+the bracketed time is context for you, not something to report back."""
 
 # Without this the model answers "I don't have access" instead of asking for
 # the tool that would give it access: the working set is small, and nothing in
