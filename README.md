@@ -986,7 +986,7 @@ and should surface as an error, never as a confident wrong answer.
 python -m unittest jarvis_tests -v
 ```
 
-463 tests, about 34 seconds, no external network and no model needed. They
+472 tests, about 33 seconds, no external network and no model needed. They
 cover the autonomy gate, tool schema validation, argument coercion, VLM output
 filtering, coordinate parsing, vision-model corroboration and sizing,
 visual-memory confidence, the visual-memory keyword index, multi-monitor
@@ -1354,13 +1354,41 @@ coordinate *is* the coordinate to tap and no transform exists anywhere in this
 path. `wm size` reports `init=` and is the single most misleading command in the
 channel — a test pins that it is never called.
 
+### Coordinates go stale, so reads and taps are tied together
+
+Hoopa's Vault animates and runs countdown timers — `Approaching`, `21h 47m`,
+`Clear 3 more` — so the screen is genuinely different every second. Reading a
+label list and then tapping a coordinate from it is unsafe at any distance,
+because the layout underneath may have moved.
+
+This was not a hypothetical: a tap aimed from a coordinate map captured two
+minutes and one screen-change earlier landed on a control that was never on
+that map. **Always pass the `frame_id` from your read.** `game_screen_text`
+returns one; `game_tap` and `game_swipe` re-capture and refuse if it no longer
+matches:
+
+```
+the screen has moved on since it was read (it was a1b2c3d4e5f6, it is now
+9f8e7d6c5b4a), so those coordinates point somewhere else now. Read the screen
+again and choose from the new one.
+```
+
+The refused tap is never delivered — a test asserts no `input tap` reaches the
+fake adb after a mismatch. Omitting `frame_id` still taps, because a deliberate
+blind tap on a stable screen is legitimate; this guards against accidents
+rather than locking the channel.
+
+Note that `KEYCODE_BACK` does **not** undo an in-game tab. Android's back key
+is swallowed by the game, so a tap into a menu cannot be reversed that way;
+the way out is another tap on a nav tab, found from a fresh read.
+
 ### Tools
 
 | Tool | What it does |
 |---|---|
 | `game_state` | Connection, frame size, foreground app, whether the bot is playing |
-| `game_screen_text` | OCR one fresh frame (~2.7s). `psm` defaults to `11`, for labels scattered over artwork |
-| `game_tap` | Tap, in frame pixels. Out-of-frame coordinates are refused, never clamped |
+| `game_screen_text` | OCR one fresh frame (~2.7s). `psm` defaults to `11`, for labels scattered over artwork. Returns the `frame_id` to pass to a tap |
+| `game_tap` | Tap, in frame pixels. Out-of-frame coordinates are refused, never clamped. Pass the read's `frame_id` |
 | `game_swipe` | Drag, for scrolling and dragging |
 | `game_press_key` | `back`, `home`, `enter`, `menu`, `power`, `volup`, `voldown`, `backspace` |
 | `game_bot` | `status` / `start` / `stop` / `log` for the Hoopa's Vault bot |

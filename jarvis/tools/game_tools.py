@@ -74,7 +74,8 @@ def _guard(action: str):
     "Read the text on the emulator's game screen by capturing the device "
     "framebuffer. This is the only way to see the game: reading the desktop "
     "screen returns nothing, because the game is rendered too small inside the "
-    "emulator window. Takes about 2.7 seconds per call.",
+    "emulator window. Takes about 2.7 seconds per call. Returns a frame_id; "
+    "pass it to game_tap so the tap is refused if the screen moved in between.",
     {
         "type": "object",
         "properties": {
@@ -91,15 +92,16 @@ def _guard(action: str):
     tags=("game", "sight"),
 )
 def game_screen_text(psm: int = 11) -> dict[str, Any]:
-    text, (width, height) = _guard(lambda: _link().screen_text(psm=psm))
+    text, (width, height), frame_id = _guard(lambda: _link().screen_text(psm=psm))
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return {
         "text": text,
         "lines": lines,
         "frame": [width, height],
+        "frame_id": frame_id,
         "note": (
             f"frame is {width}x{height} device pixels; tap coordinates use "
-            "this same space"
+            "this same space. Pass frame_id to game_tap."
         ),
     }
 
@@ -134,7 +136,11 @@ def game_state() -> dict[str, Any]:
     "game_tap",
     "Tap a point on the game screen inside the emulator. Coordinates are in "
     "game-screen pixels (about 900x1600), NOT desktop pixels. Run "
-    "game_screen_text first to read labels and game_state to check the size.",
+    "game_screen_text first to read labels and game_state to check the size, "
+    "and pass that call's frame_id back here: this screen animates and its "
+    "timers count down, so a tap aimed from a stale read lands on whatever "
+    "happens to be there now instead. With a frame_id the tap is refused "
+    "when the screen has moved, and you are asked to read again.",
     {
         "type": "object",
         "properties": {
@@ -144,18 +150,30 @@ def game_state() -> dict[str, Any]:
                 "type": "string",
                 "description": "What was tapped, for the transcript. Purely for the record.",
             },
+            "frame_id": {
+                "type": "string",
+                "description": (
+                    "frame_id from the game_screen_text these coordinates came "
+                    "from. Strongly recommended."
+                ),
+            },
         },
         "required": ["x", "y"],
     },
     tags=("game", "act"),
 )
-def game_tap(x: int, y: int, label: str = "") -> dict[str, Any]:
+def game_tap(x: int, y: int, label: str = "", frame_id: str = "") -> dict[str, Any]:
+    if frame_id:
+        # Checked before the bounds check so the message is about the screen
+        # moving, which is the thing the caller can actually do something about.
+        _guard(lambda: _link().verify_unchanged(frame_id))
     point = _guard(lambda: _link().tap(x, y))
     width, height = _link().frame_size()
     return {
         "tapped": list(point),
         "label": label,
         "frame": [width, height],
+        "verified_frame": frame_id or None,
         "detail": "tap delivered over ADB to the emulator",
     }
 
@@ -163,7 +181,9 @@ def game_tap(x: int, y: int, label: str = "") -> dict[str, Any]:
 @registry.add(
     "game_swipe",
     "Swipe on the game screen, for dragging and scrolling. Coordinates are in "
-    "game-screen pixels (about 900x1600), not desktop pixels.",
+    "game-screen pixels (about 900x1600), not desktop pixels. This screen "
+    "animates, so pass the frame_id from the read the coordinates came from "
+    "and the swipe is refused if it has moved on.",
     {
         "type": "object",
         "properties": {
@@ -175,14 +195,19 @@ def game_tap(x: int, y: int, label: str = "") -> dict[str, Any]:
                 "type": "integer",
                 "description": "How long the drag lasts, 50-1500ms. Slow drags are read as scrolls.",
             },
+            "frame_id": {"type": "string", "description": "frame_id from the read these came from."},
         },
         "required": ["x1", "y1", "x2", "y2"],
     },
     tags=("game", "act"),
 )
-def game_swipe(x1: int, y1: int, x2: int, y2: int, ms: int = 300) -> dict[str, Any]:
+def game_swipe(x1: int, y1: int, x2: int, y2: int, ms: int = 300,
+               frame_id: str = "") -> dict[str, Any]:
+    if frame_id:
+        _guard(lambda: _link().verify_unchanged(frame_id))
     moved = _guard(lambda: _link().swipe(x1, y1, x2, y2, ms))
-    return {"swiped": list(moved), "detail": "swipe delivered over ADB to the emulator"}
+    return {"swiped": list(moved), "verified_frame": frame_id or None,
+            "detail": "swipe delivered over ADB to the emulator"}
 
 
 @registry.add(

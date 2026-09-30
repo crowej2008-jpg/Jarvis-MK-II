@@ -183,7 +183,24 @@ class GameLink:
         `exec-out` is used rather than a shell pipe because a shell mangles the
         PNG's binary bytes on the way out.
         """
+        return self.capture_with_id()[1]
+
+    def capture_with_id(self) -> tuple[str, Any]:
+        """A frame plus a short digest identifying it.
+
+        The digest exists because this screen is alive. Hoopa's Vault has
+        timers counting down and menus that animate in, so coordinates read a
+        moment ago are wrong a moment later, and a tap aimed from a stale map
+        lands on whatever happens to be there instead. Reading and acting are
+        therefore tied together: `game_screen_text` hands back a digest,
+        `game_tap` is given it, and the tap is refused if the screen moved.
+
+        SHA-1 over raw bytes. It is an integrity check against accidental
+        staleness, not a security boundary, so a fast non-cryptographic choice
+        is the right one; it only ever compares two frames taken seconds apart.
+        """
         import cv2
+        import hashlib
         import numpy as np
 
         raw = self._run("exec-out", "screencap", "-p", binary=True)
@@ -195,7 +212,22 @@ class GameLink:
         height, width = frame.shape[:2]
         self._frame = (width, height)
         self._frame_at = time.monotonic()
-        return frame
+        return hashlib.sha1(frame.tobytes()).hexdigest()[:12], frame
+
+    def verify_unchanged(self, frame_id: str) -> None:
+        """Raise unless the screen is still the frame the caller read.
+
+        The wording matters: this refuses a tap because the *screen* changed,
+        which is information the model can act on by reading again. It is not a
+        safety confirmation and does not pretend to be one.
+        """
+        current, _ = self.capture_with_id()
+        if current != frame_id:
+            raise GameUnavailable(
+                f"the screen has moved on since it was read (it was {frame_id}, "
+                f"it is now {current}), so those coordinates point somewhere "
+                "else now. Read the screen again and choose from the new one."
+            )
 
     def frame_size(self) -> tuple[int, int]:
         """Frame width and height, from a capture if one is recent.
@@ -242,20 +274,23 @@ class GameLink:
         match = _FOCUS_RE.search(out)
         return match.group(1) if match else ""
 
-    def screen_text(self, psm: int = 11) -> tuple[str, tuple[int, int]]:
-        """OCR one fresh frame.
+    def screen_text(self, psm: int = 11) -> tuple[str, tuple[int, int], str]:
+        """OCR one fresh frame, with the frame's digest.
 
         Sparse text (psm 11) is the default because game screens are labels
         scattered over artwork rather than paragraphs; psm 6 assumes one block
         and loses most of them. Costs about 0.8s on top of the ~1.9s capture.
+
+        The digest comes back so the caller can hand it to `tap` and have the
+        tap refused if the screen moved in between.
         """
         import pytesseract
 
         if self._tesseract:
             pytesseract.pytesseract.tesseract_cmd = self._tesseract
-        frame = self.capture()
+        frame_id, frame = self.capture_with_id()
         text = pytesseract.image_to_string(frame, config=f"--psm {int(psm)}")
-        return text, (frame.shape[1], frame.shape[0])
+        return text, (frame.shape[1], frame.shape[0]), frame_id
 
     # -- actuation --------------------------------------------------------
     def _clamp(self, x: float, y: float) -> tuple[int, int]:

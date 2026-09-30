@@ -6216,6 +6216,9 @@ class FakeAdb:
         self.devices = list(devices)
         self.out = out or ""
         self.frame = frame
+        # Bumped to make the next capture differ, which is how a test simulates
+        # a screen that moved on. Left alone, captures are byte-identical.
+        self.n = 0
         self.calls: list[list[str]] = []
 
     def __call__(self, cmd, *rest, **kwargs):
@@ -6237,7 +6240,8 @@ class FakeAdb:
             width, height = self.frame
             import cv2
 
-            ok, buf = cv2.imencode(".png", np.zeros((height, width, 3), np.uint8))
+            img = np.full((height, width, 3), self.n, np.uint8)
+            ok, buf = cv2.imencode(".png", img)
             assert ok
             return Result(buf.tobytes())
         if "dumpsys" in argv and "displays" in argv:
@@ -6253,9 +6257,12 @@ def make_game_link(fake, **kw):
 
     link = GameLink(**kw)
     link._adb_path = "fake-adb"
-    link._run = lambda *args, binary=False: (
-        fake(list(args)) if binary else fake(list(args)).stdout.decode(errors="ignore")
-    )
+
+    def _run(*args, binary=False):
+        stdout = fake(list(args)).stdout
+        return stdout if binary else stdout.decode(errors="ignore")
+
+    link._run = _run
     link.connected = lambda: list(fake.devices)
     return link
 
@@ -6420,6 +6427,122 @@ class TestGameChannelIsolation(unittest.TestCase):
                                      autonomy_denylist=["1password.exe"]))
         self.assertTrue(a.trusted("HD-Player.exe"))
         self.assertFalse(a.trusted("1password.exe"))
+
+
+class TestGameChannelStaleReads(unittest.TestCase):
+    """Observed failure, not a hypothetical one.
+
+    Hoopa's Vault animates and runs countdown timers, so coordinates read a
+    moment ago are wrong a moment later. A tap aimed from a two-minute-old map
+    landed on a control that was never on that map. The read and the act are
+    therefore tied together by a frame digest.
+    """
+
+    def _link(self):
+        fake = FakeAdb()
+        return make_game_link(fake), fake
+
+    def test_the_same_frame_verifies(self):
+        link, _ = self._link()
+        frame_id, _ = link.capture_with_id()
+        again, _ = link.capture_with_id()
+        self.assertEqual(frame_id, again)
+
+    def test_a_moved_screen_is_refused_with_an_actionable_message(self):
+        link, fake = self._link()
+        frame_id, _ = link.capture_with_id()
+        fake.n += 1  # the screen moved on
+        with self.assertRaises(Exception) as caught:
+            link.verify_unchanged(frame_id)
+        message = str(caught.exception)
+        self.assertIn("moved on", message)
+        self.assertIn("Read the screen again", message,
+                      "the refusal has to tell the caller what to do next")
+
+    def test_verify_does_not_silently_pass_a_mismatch(self):
+        link, _ = self._link()
+        with self.assertRaises(Exception):
+            link.verify_unchanged("deadbeef1234")
+
+    def test_a_capture_really_is_decoded(self):
+        """capture() used to be exercised by no test at all, which is how a
+        broken fake could hide behind a passing suite."""
+        link, _ = self._link()
+        frame = link.capture()
+        self.assertEqual((frame.shape[1], frame.shape[0]), (900, 1600))
+
+    def test_tap_with_a_stale_frame_id_never_reaches_the_device(self):
+        """The whole point: the tap must not be sent after the screen moved."""
+        from jarvis.tools import game_tools
+
+        fake = FakeAdb()
+        link = make_game_link(fake)
+        game_tools._state["link"] = link
+        try:
+            frame_id, _ = link.capture_with_id()
+            fake.n += 1  # the screen moves on
+            before = len([c for c in fake.calls if "input" in c])
+            with self.assertRaises(ToolError) as caught:
+                game_tools.game_tap(450, 800, frame_id=frame_id)
+            self.assertIn("moved on", str(caught.exception))
+            after = len([c for c in fake.calls if "input" in c])
+            self.assertEqual(before, after, "a refused tap must not be delivered")
+        finally:
+            game_tools._state.pop("link", None)
+
+    def test_a_swipe_with_a_stale_frame_id_is_refused_too(self):
+        from jarvis.tools import game_tools
+
+        fake = FakeAdb()
+        link = make_game_link(fake)
+        game_tools._state["link"] = link
+        try:
+            frame_id, _ = link.capture_with_id()
+            fake.n += 1
+            with self.assertRaises(ToolError):
+                game_tools.game_swipe(450, 1200, 450, 400, frame_id=frame_id)
+            self.assertFalse([c for c in fake.calls if "swipe" in c])
+        finally:
+            game_tools._state.pop("link", None)
+
+    def test_a_matching_frame_id_lets_the_tap_through(self):
+        from jarvis.tools import game_tools
+
+        fake = FakeAdb()
+        link = make_game_link(fake)
+        game_tools._state["link"] = link
+        try:
+            frame_id, _ = link.capture_with_id()
+            out = game_tools.game_tap(450, 800, frame_id=frame_id)
+            self.assertEqual(out["tapped"], [450, 800])
+            self.assertEqual(out["verified_frame"], frame_id)
+        finally:
+            game_tools._state.pop("link", None)
+
+    def test_screen_text_hands_back_a_frame_id_to_pass_on(self):
+        from jarvis.tools import game_tools
+
+        link = make_game_link(FakeAdb())
+        link.screen_text = lambda psm=11: ("Bag\nHome", (900, 1600), "abc123def456")
+        game_tools._state["link"] = link
+        try:
+            out = game_tools.game_screen_text()
+            self.assertEqual(out["frame_id"], "abc123def456")
+            self.assertIn("frame_id", out["note"])
+        finally:
+            game_tools._state.pop("link", None)
+
+    def test_omitting_the_frame_id_still_taps(self):
+        """Opt-in by design: a deliberate blind tap on a stable screen is a
+        legitimate move, so this is a guard against accidents, not a lock."""
+        from jarvis.tools import game_tools
+
+        fake = FakeAdb()
+        game_tools._state["link"] = make_game_link(fake)
+        try:
+            self.assertEqual(game_tools.game_tap(450, 800)["tapped"], [450, 800])
+        finally:
+            game_tools._state.pop("link", None)
 
 
 class TestGameBotControl(unittest.TestCase):
