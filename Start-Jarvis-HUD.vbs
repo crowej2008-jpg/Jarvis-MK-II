@@ -45,14 +45,37 @@ If WScript.Arguments.Count > 0 Then
   Next
 End If
 
+' One JARVIS at a time. Two instances both open the microphone and the ack
+' stream, and the second one wins the device while the first keeps displaying a
+' mic that is no longer its own. Refusing is also the honest answer to somebody
+' who clicks again because the window has not appeared yet.
+If JarvisAlreadyRunning() Then
+  MsgBox "JARVIS is already running." & vbCrLf & vbCrLf & _
+         "Look for the J.A.R.V.I.S. window, or check the taskbar. Starting a " & _
+         "second copy would take the microphone away from the first one.", _
+         vbExclamation, "JARVIS"
+  WScript.Quit 0
+End If
+
 ' Start marker so the log can be trimmed to just this run's output; without it
 ' the tail below could quote an error from an earlier session.
-Dim marker
+'
+' This must never be able to stop the launcher. A second launch happens the
+' moment the first one looks like it did nothing - the window is slow, or it is
+' behind something - and by then the first instance's cmd redirection is still
+' holding this log open, so appending to it fails with "Permission denied"
+' (800A0046). That is cosmetic information failing loudly and killing the app
+' launch with it, so it is swallowed and the marker is simply skipped.
+Dim log, marker
 marker = "=== run " & Now & " ==="
-Dim log
+On Error Resume Next
 Set log = fso.OpenTextFile(logPath, 8, True)
-log.WriteLine marker
-log.Close
+If Err.Number = 0 Then
+  log.WriteLine marker
+  log.Close
+End If
+Err.Clear
+On Error GoTo 0
 
 ' Window style 0 is "hidden". Going through cmd is what makes the redirection
 ' possible; pythonw cannot redirect its own output on Windows.
@@ -110,6 +133,27 @@ Function FindPythonw()
     Exit Do
   Loop
   If best <> "" Then FindPythonw = best
+End Function
+
+Function JarvisAlreadyRunning()
+  ' Any live pythonw running "-m jarvis" is a session that already owns the
+  ' microphone. WMI can fail on a locked-down box, and then this returns False,
+  ' which is the old behaviour rather than refusing to start. Iterating the
+  ' collection rather than testing .Count avoids the -1 that a forward-only
+  ' result set reports.
+  On Error Resume Next
+  JarvisAlreadyRunning = False
+  Dim svc, coll, hit
+  Set svc = GetObject("winmgmts:\\.\root\cimv2")
+  If Err.Number <> 0 Then Exit Function
+  Set coll = svc.ExecQuery( _
+    "SELECT ProcessId FROM Win32_Process " & _
+    "WHERE Name='pythonw.exe' AND CommandLine LIKE '%-m jarvis%'")
+  If Err.Number <> 0 Then Exit Function
+  For Each hit In coll
+    JarvisAlreadyRunning = True
+    Exit Function
+  Next
 End Function
 
 Function ReadTail(path, maxChars)
