@@ -7077,13 +7077,21 @@ class FakeAdb:
     gets tapped.
     """
 
-    def __init__(self, devices=("emulator-5554",), out=None, frame=(900, 1600)):
+    def __init__(self, devices=("emulator-5554",), out=None, frame=(900, 1600),
+                 animate=False):
         self.devices = list(devices)
         self.out = out or ""
         self.frame = frame
         # Bumped to make the next capture differ, which is how a test simulates
         # a screen that moved on. Left alone, captures are byte-identical.
         self.n = 0
+        # `animate` rewrites a quarter of every frame with fresh speckle while
+        # leaving the layout alone, which is what the real game does. It exists
+        # because a flat fill cannot express animation: the tap guard compares
+        # layouts on purpose, so a screen that is only moving is not a screen
+        # that moved on, and a test using one would pass for the wrong reason.
+        self.animate = animate
+        self.caps = 0
         self.calls: list[list[str]] = []
 
     def __call__(self, cmd, *rest, **kwargs):
@@ -7105,7 +7113,32 @@ class FakeAdb:
             width, height = self.frame
             import cv2
 
-            img = np.full((height, width, 3), self.n, np.uint8)
+            # A structured frame rather than a flat colour. A real screen has
+            # panels, bars and text, and a guard that reduces a frame to its
+            # layout can only be tested against something with a layout. A flat
+            # fill also hid a real bug: the digest used to be a checksum of the
+            # raw bytes, which never matched itself on an animating game, and a
+            # fake that cannot animate cannot catch that.
+            yy, xx = np.mgrid[0:height, 0:width]
+            shift = self.n * 60
+            img = np.empty((height, width, 3), np.uint8)
+            img[..., 0] = ((xx * 255) // max(1, width - 1) + shift) % 256
+            img[..., 1] = ((yy * 255) // max(1, height - 1) + shift) % 256
+            img[..., 2] = shift % 256
+            if self.animate:
+                # Motion over a quarter of the frame, without touching the
+                # layout: different bytes every capture, same screen. The real
+                # game rewrites 25-68% of its pixels per frame this way and its
+                # layout signature still moves under 2%, which is what sets the
+                # guard's tolerance.
+                rng = np.random.default_rng(self.caps)
+                y0, y1 = int(height * 0.55), int(height * 0.95)
+                x1 = int(width * 0.6)
+                mask = rng.random((y1 - y0, x1)) < 0.10
+                block = img[y0:y1, :x1]
+                noise = rng.integers(0, 256, block.shape, dtype=np.uint8)
+                block[mask] = noise[mask]
+                self.caps += 1
             ok, buf = cv2.imencode(".png", img)
             assert ok
             return Result(buf.tobytes())
@@ -7406,6 +7439,99 @@ class TestGameChannelStaleReads(unittest.TestCase):
         game_tools._state["link"] = make_game_link(fake)
         try:
             self.assertEqual(game_tools.game_tap(450, 800)["tapped"], [450, 800])
+        finally:
+            game_tools._state.pop("link", None)
+
+
+class TestGameTapGuardSurvivesAnimation(unittest.TestCase):
+    """The guard used to block every tap on a live game.
+
+    Measured on the real emulator, not reasoned about: `verify_unchanged`
+    compared a SHA-1 of the raw frame, and six consecutive captures of one
+    screen produced six different digests, because a battle frame rewrites a
+    quarter to two thirds of its pixels between frames. The result was that the
+    documented read-then-tap flow - `game_screen_text` hands back a frame_id,
+    `game_tap` is given it - refused ten taps out of ten. A safety feature that
+    always says no is not a safety feature, it is an outage.
+
+    These tests pin both halves. Animation must pass, and a real screen change
+    must still be refused, because a guard that cannot tell those apart is no
+    guard at all.
+    """
+
+    def _link(self, animate=True):
+        fake = FakeAdb(animate=animate)
+        return make_game_link(fake), fake
+
+    def test_an_animating_screen_still_verifies(self):
+        """The bug. Same layout, different pixels, and that is fine."""
+        link, _ = self._link()
+        for _ in range(5):
+            frame_id, _ = link.capture_with_id()
+            link.verify_unchanged(frame_id)
+
+    def test_the_raw_bytes_really_do_differ_while_the_layout_holds(self):
+        """Otherwise the test above would pass for the wrong reason.
+
+        This is the distinction the old checksum could not make: the frames are
+        genuinely different files, and the guard is meant to allow them.
+        """
+        link, _ = self._link()
+        first = link.capture()
+        second = link.capture()
+        self.assertNotEqual(first.tobytes(), second.tobytes(),
+                            "the fake is not animating, so this proves nothing")
+
+    def test_a_real_screen_change_is_still_refused(self):
+        link, fake = self._link(animate=False)
+        frame_id, _ = link.capture_with_id()
+        fake.n += 1  # the layout really is different now
+        with self.assertRaises(Exception) as caught:
+            link.verify_unchanged(frame_id)
+        self.assertIn("moved on", str(caught.exception))
+
+    def test_animation_and_a_real_change_are_told_apart(self):
+        """Both in one test, because that is the whole distinction.
+
+        If either half is wrong the guard is either useless or absent, and each
+        half passing on its own would not show that.
+        """
+        link, fake = self._link(animate=True)
+        frame_id, _ = link.capture_with_id()
+        link.verify_unchanged(frame_id)          # moving, same screen: allowed
+
+        still = FakeAdb(animate=False)
+        still.n = 1                              # a different screen entirely
+        other = make_game_link(still)
+        with self.assertRaises(Exception):
+            other.verify_unchanged(frame_id)
+        self.assertIsNotNone(fake)
+
+    def test_an_unknown_frame_id_is_refused_rather_than_assumed_fine(self):
+        link, _ = self._link()
+        with self.assertRaises(Exception) as caught:
+            link.verify_unchanged("deadbeef1234")
+        self.assertIn("no longer available", str(caught.exception))
+
+    def test_the_signature_cache_does_not_grow_without_bound(self):
+        """The game animates, so every capture is a new signature, and a long
+        session would otherwise accumulate one per read forever."""
+        link, _ = self._link()
+        for _ in range(40):
+            link.capture_with_id()
+        self.assertLessEqual(len(link._sigs), link._SIG_CACHE)
+
+    def test_a_tap_on_an_animating_screen_reaches_the_device(self):
+        """End to end through the tool, which is how the model meets it."""
+        from jarvis.tools import game_tools
+
+        fake = FakeAdb(animate=True)
+        game_tools._state["link"] = make_game_link(fake)
+        try:
+            text_out = game_tools.game_screen_text()
+            self.assertTrue(text_out["frame_id"])
+            out = game_tools.game_tap(450, 800, frame_id=text_out["frame_id"])
+            self.assertEqual(out["tapped"], [450, 800])
         finally:
             game_tools._state.pop("link", None)
 

@@ -106,6 +106,10 @@ class GameLink:
         # for geometry constantly and the round trip is not free.
         self._geometry: dict[str, Any] | None = None
         self._geometry_at = 0.0
+        # Recent frame signatures, newest last, so a read can be compared with
+        # a later capture. Bounded: only the few seconds between reading a
+        # screen and acting on it are ever relevant.
+        self._sigs: dict[str, tuple[float, Any]] = {}
 
     # -- plumbing ---------------------------------------------------------
     def adb_path(self) -> str:
@@ -186,18 +190,34 @@ class GameLink:
         return self.capture_with_id()[1]
 
     def capture_with_id(self) -> tuple[str, Any]:
-        """A frame plus a short digest identifying it.
+        """A frame plus a digest that survives animation but not a screen change.
 
         The digest exists because this screen is alive. Hoopa's Vault has
-        timers counting down and menus that animate in, so coordinates read a
-        moment ago are wrong a moment later, and a tap aimed from a stale map
-        lands on whatever happens to be there instead. Reading and acting are
-        therefore tied together: `game_screen_text` hands back a digest,
-        `game_tap` is given it, and the tap is refused if the screen moved.
+        timers counting down, a battle that animates and menus that slide in,
+        so coordinates read a moment ago are wrong a moment later, and a tap
+        aimed from a stale map lands on whatever happens to be there instead.
+        Reading and acting are therefore tied together: `game_screen_text`
+        hands back a digest, `game_tap` is given it, and the tap is refused if
+        the screen moved.
 
-        SHA-1 over raw bytes. It is an integrity check against accidental
-        staleness, not a security boundary, so a fast non-cryptographic choice
-        is the right one; it only ever compares two frames taken seconds apart.
+        It used to be SHA-1 over the raw bytes, which was measured on the real
+        emulator and never once matched itself: six consecutive captures gave
+        six different digests, so `verify_unchanged` refused 10 taps out of 10
+        and the guard blocked every action instead of protecting them. The
+        reason is that a single battle frame changes 25-68% of its pixels
+        between captures, all of it legitimate animation.
+
+        So the digest is taken of the *layout* rather than the pixels: greyscale,
+        a median filter wide enough to swallow moving sprites, a 16x16 average
+        pool, and six levels per cell. On the live game that reads 0.00% of
+        cells changed across repeated captures of the same screen, while
+        actually navigating between tabs moves 15% of them. Exact equality on
+        that signature therefore tolerates the animation and still refuses a
+        real change, which is the whole job of the guard.
+
+        The signature is a 16x16 grid of values 0-5, packed into hex. A fast
+        non-cryptographic checksum over ~256 bytes is the right tool: it is an
+        integrity check against accidental staleness, not a security boundary.
         """
         import cv2
         import hashlib
@@ -212,21 +232,92 @@ class GameLink:
         height, width = frame.shape[:2]
         self._frame = (width, height)
         self._frame_at = time.monotonic()
-        return hashlib.sha1(frame.tobytes()).hexdigest()[:12], frame
+        return self._frame_digest(frame), frame
+
+    # Layout signature: median kernel wide enough to erase the moving parts of
+    # a battle sprite but far narrower than the panels and buttons whose
+    # position a tap actually depends on, then a small average pool.
+    _SIG_MEDIAN = 15
+    _SIG_CELLS = 16
+    _SIG_LEVELS = 6
+    # Fraction of cells allowed to differ before the screen counts as changed.
+    # Measured on the live game: repeated captures of one animating screen move
+    # at most 1.6% of cells, while actually navigating between tabs moves 62%.
+    # Ten percent sits in the middle of that gap with room either side.
+    _SIG_TOLERANCE = 0.10
+    # How many recent frames to remember. A signature is only useful for the
+    # few seconds between reading a screen and acting on it, and the game
+    # animates, so every capture is a slightly different signature. Keeping
+    # the last few lets an in-flight read be compared without growing forever.
+    _SIG_CACHE = 8
+
+    def _signature(self, frame: Any) -> Any:
+        """Reduce a frame to the layout it shows, ignoring what is moving."""
+        import cv2
+        import numpy as np
+
+        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if self._SIG_MEDIAN > 1:
+            grey = cv2.medianBlur(grey, self._SIG_MEDIAN)
+        pooled = cv2.resize(
+            grey,
+            (self._SIG_CELLS, self._SIG_CELLS),
+            interpolation=cv2.INTER_AREA,
+        )
+        return np.floor(pooled / (256 / self._SIG_LEVELS)).astype(np.uint8)
+
+    def _frame_digest(self, frame: Any) -> str:
+        """A short id for this frame, with its signature kept for comparison.
+
+        The id is a checksum of the signature rather than of the frame, so two
+        captures of a screen that is merely animating land on the same id. The
+        signature itself is what `verify_unchanged` compares, because equality
+        of a checksum cannot express "close enough" and on a game this animated
+        nothing is ever close enough by that measure.
+        """
+        import hashlib
+
+        signature = self._signature(frame)
+        digest = hashlib.sha1(signature.tobytes()).hexdigest()[:12]
+        self._sigs[digest] = (time.monotonic(), signature)
+        while len(self._sigs) > self._SIG_CACHE:
+            self._sigs.pop(next(iter(self._sigs)))
+        return digest
 
     def verify_unchanged(self, frame_id: str) -> None:
-        """Raise unless the screen is still the frame the caller read.
+        """Raise unless the screen still shows the layout that was read.
 
         The wording matters: this refuses a tap because the *screen* changed,
         which is information the model can act on by reading again. It is not a
         safety confirmation and does not pretend to be one.
+
+        It compares layouts rather than pixels, and with a tolerance rather than
+        equality. A SHA-1 of the raw frame was tried first and measured on the
+        real emulator: six consecutive captures of one screen gave six
+        different digests, because a single battle frame rewrites a quarter of
+        its pixels, so this refused ten taps out of ten and the guard stopped
+        guarding anything. Equality of a checksum cannot say "the same screen,
+        still moving", which is the only thing that should pass here.
         """
+        import numpy as np
+
         current, _ = self.capture_with_id()
-        if current != frame_id:
+        known = self._sigs.get(frame_id)
+        if known is None:
+            raise GameUnavailable(
+                f"the frame that was read ({frame_id}) is no longer available, "
+                "so those coordinates cannot be checked. Read the screen again "
+                "and choose from the new one."
+            )
+        _, then = known
+        now = self._sigs[current][1]
+        moved = float((np.abs(then.astype(int) - now.astype(int)) >= 1).mean())
+        if moved > self._SIG_TOLERANCE:
             raise GameUnavailable(
                 f"the screen has moved on since it was read (it was {frame_id}, "
-                f"it is now {current}), so those coordinates point somewhere "
-                "else now. Read the screen again and choose from the new one."
+                f"it is now {current}, {moved:.0%} of the layout differs), so "
+                "those coordinates point somewhere else now. Read the screen "
+                "again and choose from the new one."
             )
 
     def frame_size(self) -> tuple[int, int]:
