@@ -3858,6 +3858,182 @@ class ProcedureRecallIsNotConfusedAcrossApps(unittest.TestCase):
                          "steps, which is the substitution this guards against")
 
 
+class TestJarvisDoesNotWakeOnItsOwnVoice(unittest.TestCase):
+    """The feedback loop, closed.
+
+    A recorded session showed JARVIS answering itself: the wake word fired at
+    0.96 while the speakers were playing, opened a turn, Whisper transcribed
+    the previous reply as the question, and the next reply triggered the one
+    after that. Three independent causes fed it, and all three are here:
+
+      - the wake model ran while the speakers were live
+      - the utterance recorded the tail of the wake word and answered it
+      - nothing stopped a short echo from becoming a turn
+
+    The threshold is deliberately untouched. The false fires in the log were
+    0.70-0.81 and every one happened while JARVIS was speaking, which the mute
+    covers; raising the bar would only make the hotword harder to trigger.
+    """
+
+    BLOCK = 320
+
+    def _wake(self):
+        from jarvis.wake import WakeWord
+
+        ww = WakeWord(model_name="hey_jarvis", threshold=0.5)
+        self.predicts = 0
+
+        class Always:
+            def predict(inner, pcm):  # noqa: ANN001
+                self.predicts += 1
+                return {"hey_jarvis": 0.99}
+
+        ww._model = Always()
+        return ww
+
+    def _speech(self, ww, blocks=12):
+        signal = np.linspace(-0.5, 0.5, blocks * self.BLOCK, dtype=np.float32)
+        fired = None
+        for i in range(0, len(signal), self.BLOCK):
+            got = ww.feed(signal[i:i + self.BLOCK])
+            if got is not None:
+                fired = got
+        return fired
+
+    # -- the mute ---------------------------------------------------------
+    def test_a_muted_wake_word_never_fires_however_loud_it_is(self):
+        ww = self._wake()
+        ww.mute()
+        self.assertIsNone(self._speech(ww))
+        self.assertEqual(self.predicts, 0,
+                         "a muted detector must not even run the model")
+
+    def test_unmuting_restores_the_wake_word(self):
+        ww = self._wake()
+        ww.mute()
+        self.assertIsNone(self._speech(ww))
+        ww.unmute()
+        self.assertIsNotNone(self._speech(ww))
+
+    def test_muting_clears_the_buffer_so_the_echo_is_not_replayed(self):
+        ww = self._wake()
+        signal = np.linspace(-0.5, 0.5, 6 * self.BLOCK, dtype=np.float32)
+        for i in range(0, len(signal), self.BLOCK):
+            ww.feed(signal[i:i + self.BLOCK])
+        self.assertGreater(ww._buf_len, 0, "expected buffered audio")
+        ww.mute()
+        self.assertEqual(ww._buf_len, 0,
+                         "stale audio would score as a fresh wake word")
+
+    # -- the wrapper ------------------------------------------------------
+    def test_speaking_mutes_the_wake_word_and_releases_it_afterwards(self):
+        from jarvis.hud import _EchoGuard
+
+        class FakeWake:
+            def __init__(self):
+                self.muted = False
+                self.calls = 0
+
+            def mute(self):
+                self.calls += 1
+                self.muted = True
+
+            def unmute(self):
+                self.calls += 1
+                self.muted = False
+
+        class SlowSpeaker:
+            def speak(self, text, on_done=None):
+                # The wake word must already be muted at this point, which is
+                # the whole point: the audio is about to leave the speakers.
+                muted_during_speech.append(wake.muted)
+                return None
+
+        muted_during_speech: list = []
+        wake = FakeWake()
+        guard = _EchoGuard(SlowSpeaker(), wake)
+        guard.TAIL_S = 0.0
+        guard.speak("hello")
+        self.assertEqual(muted_during_speech, [True])
+        self.assertFalse(wake.muted, "the wake word stayed deaf after speaking")
+        self.assertEqual(wake.calls, 2, "mute then unmute, once each")
+
+    def test_the_wake_word_is_released_even_when_speech_raises(self):
+        from jarvis.hud import _EchoGuard
+
+        class Wake:
+            def __init__(self):
+                self.muted = False
+
+            def mute(self):
+                self.muted = True
+
+            def unmute(self):
+                self.muted = False
+
+        class Exploding:
+            def speak(self, text, on_done=None):
+                raise RuntimeError("speech engine died")
+
+        wake = Wake()
+        guard = _EchoGuard(Exploding(), wake)
+        guard.TAIL_S = 0.0
+        with self.assertRaises(RuntimeError):
+            guard.speak("hello")
+        self.assertFalse(wake.muted,
+                         "a crash in speech must not leave the mic deaf forever")
+
+    def test_the_wrapper_still_exposes_the_real_speaker(self):
+        from jarvis.hud import _EchoGuard
+
+        class Speaker:
+            name = "sapi"
+
+            def voices(self):
+                return ["Microsoft David"]
+
+        guard = _EchoGuard(Speaker(), None)
+        self.assertEqual(guard.voices(), ["Microsoft David"],
+                         "the wrapper must not hide the engine from callers")
+        self.assertFalse(guard.speaking)
+
+    def test_a_missing_speaker_is_harmless(self):
+        from jarvis.hud import _EchoGuard
+
+        guard = _EchoGuard(None, None)
+        self.assertIsNone(guard.speak("hello"))
+        self.assertIsNone(guard.stop())
+        self.assertFalse(guard.speaking)
+
+    # -- the echo transcript ---------------------------------------------
+    def test_the_wake_word_transcript_is_not_answered(self):
+        from jarvis.hud import _is_wake_word_echo
+
+        # The real string from the log, at a plausible duration.
+        self.assertTrue(_is_wake_word_echo(
+            "a jarvis, burn off, a jarvis, burn off.", 0.4))
+        self.assertTrue(_is_wake_word_echo("Hey Jarvis.", 0.5))
+        self.assertTrue(_is_wake_word_echo("jarvis", 0.4))
+        self.assertTrue(_is_wake_word_echo("", 0.3))
+
+    def test_a_real_question_is_answered_even_when_short(self):
+        from jarvis.hud import _is_wake_word_echo
+
+        self.assertFalse(_is_wake_word_echo("how do I make tea?", 3.0))
+        self.assertFalse(_is_wake_word_echo("open steam", 0.9))
+        self.assertFalse(_is_wake_word_echo("what time is it", 1.8))
+        # Short answers are real speech and must survive.
+        for word in ("yes", "no", "sure", "stop", "wait"):
+            self.assertFalse(_is_wake_word_echo(word, 0.4),
+                             f"{word!r} is a real answer, not an echo")
+
+    def test_a_long_utterance_named_jarvis_is_still_a_question(self):
+        from jarvis.hud import _is_wake_word_echo
+
+        self.assertFalse(_is_wake_word_echo("hey jarvis what time is it", 2.5))
+        self.assertFalse(_is_wake_word_echo("jarvis open steam", 1.5))
+
+
 class TestWakeFraming(unittest.TestCase):
     """The mic delivers 20ms blocks; the model wants non-overlapping 80ms frames.
 

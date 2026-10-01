@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import math
 import queue
+import re
 import sys
 import threading
 import textwrap
@@ -809,6 +810,105 @@ def level_fraction(rms: float) -> float:
     return max(0.0, min(1.0, (db + 55.0) / 55.0))
 
 
+def _is_wake_word_echo(text: str, seconds: float) -> bool:
+    """True when a short transcript is just the wake phrase being heard twice.
+
+    The recording opens 400ms before speech onset, so it always contains the
+    tail of "hey jarvis". Whisper then transcribes that tail, and the mangled
+    results are not guessable - a recorded session shows "a jarvis, burn off"
+    for the same phrase it renders as "hey jarvis" elsewhere, so matching on
+    words alone has to fail one case or the other.
+
+    Duration is the signal that holds. The wake phrase is under half a second;
+    an actual question is not, and the difference is a wide margin rather than
+    a boundary. A short transcript that also contains no verb-like content is
+    treated as the echo, which keeps "yes", "sure" and "no" - genuine short
+    answers - from being thrown away.
+    """
+    if not text:
+        return True
+    if seconds > 1.2:
+        return False
+    words = [w for w in re.sub(r"[^a-z']+", " ", text.lower()).split() if w]
+    if not words:
+        return True
+    # Real short answers carry a word that is not filler or the assistant's name.
+    real = [w for w in words
+            if w not in ("hey", "heyya", "a", "the", "ok", "okay", "uh", "um",
+                         "er", "hmm", "jarvis", "jarvis'", "s", "is", "it",
+                         "on", "off", "burn", "and", "the")]
+    return not real
+
+
+class _EchoGuard:
+    """Mutes the wake word for exactly as long as the speaker is talking.
+
+    The microphone in a voice assistant is an open loop: the speakers feed
+    straight back into it. The model scores JARVIS's own reply at 0.96 against
+    a 0.50 threshold, so without this the wake word fires on the reply, opens a
+    new turn, and JARVIS answers its own voice. A recorded session shows
+    exactly that, with Whisper transcribing the previous reply as the next
+    question - "fast path: answered 'a Jarvis, burn off'".
+
+    This wraps the speaker rather than the two call sites that use it, because
+    the ack cue and the reply both come from the speakers and both have to be
+    covered. `speak` is blocking, so the mute is held for the length of the
+    utterance and lifted afterwards. A short tail is added because the room
+    rings after the last word, and unmuting on the final sample would let the
+    reverb of "JARVIS" trigger the next turn.
+    """
+
+    TAIL_S = 0.6
+
+    def __init__(self, speaker: Any, wake: Any):
+        self._speaker = speaker
+        self._wake = wake
+
+    def _mute(self) -> None:
+        if self._wake is not None:
+            try:
+                self._wake.mute()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _unmute(self) -> None:
+        if self._wake is not None:
+            try:
+                time.sleep(self.TAIL_S)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._wake.unmute()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def speak(self, text: str, on_done: Any = None) -> Any:
+        self._mute()
+        try:
+            if self._speaker is None:
+                return None
+            return self._speaker.speak(text, on_done) if on_done else \
+                self._speaker.speak(text)
+        finally:
+            self._unmute()
+
+    def stop(self) -> Any:
+        """Barge-in. The wake word is already unmuted here by definition."""
+        if self._speaker is None:
+            return None
+        return self._speaker.stop()
+
+    @property
+    def speaking(self) -> bool:
+        return bool(self._speaker is not None
+                    and getattr(self._speaker, "speaking", False))
+
+    def __getattr__(self, name: str) -> Any:
+        # voices() and anything else the speaker offers still reaches the real
+        # object, so the wrapper cannot become a wall in front of the engine.
+        return getattr(self._speaker, name)
+
+
 class HudVoice:
     """The microphone, driven from the display instead of a terminal.
 
@@ -826,7 +926,6 @@ class HudVoice:
     them would be a lot of dead code pretending to be reuse. So the pieces are
     reused and the loop is written for this front end.
     """
-
     def __init__(
         self,
         assistant: Any,
@@ -854,6 +953,13 @@ class HudVoice:
         # Read once at construction, like the console loop: the cue must not
         # change behaviour halfway through a session.
         self.ack_sound = getattr(cfg, "acknowledge_sound", "") or ""
+        # The speaker is wrapped so that anything which makes a sound also
+        # deafens the hotword for as long as it lasts. Without this the
+        # microphone hears the reply, scores it as the wake word, and starts
+        # another turn, which is how a single question became a conversation
+        # with itself.
+        self.speaker = _EchoGuard(speaker or getattr(assistant, "speaker", None),
+                                  self.wake)
 
     # -- reporting -------------------------------------------------------
     def _level(self) -> None:
@@ -968,6 +1074,19 @@ class HudVoice:
         self._acknowledge()
         if not text:
             self.state.note("heard something, but no words", "failed")
+            self._start_meter()
+            return
+
+        # The recording starts just before the wake word finishes, so Whisper
+        # quite reasonably transcribes the wake word itself. Answering that
+        # produces a reply to "hey jarvis", which is a turn nobody asked for and
+        # the first link in the chain that has JARVIS talking to itself.
+        rate = getattr(self.mic, "sample_rate", None) or getattr(
+            self.cfg, "sample_rate", 16000
+        )
+        seconds = len(audio) / max(1, rate)
+        if _is_wake_word_echo(text, seconds):
+            self.state.note("heard the wake word again, waiting", "system")
             self._start_meter()
             return
 

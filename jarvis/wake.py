@@ -43,6 +43,31 @@ class WakeWord:
         self._last_fire = 0.0
         self._lock = threading.Lock()
         self._on_wake: Callable[[float], None] | None = None
+        # While muted the model is not run at all. openWakeWord is fast enough
+        # to be worth skipping outright, and a muted detector that still scores
+        # audio is one refactor away from firing anyway.
+        self._muted = False
+
+    # -- muting -------------------------------------------------------------
+    def mute(self) -> None:
+        """Stop listening for the hotword until unmute() is called.
+
+        This is for the speaker, not the user. The microphone is an open loop:
+        whatever comes out of the speakers goes straight back into it, and the
+        model scores JARVIS's own voice at 0.96 against a 0.50 threshold, so an
+        unmuted detector answers its own voice, and each reply triggers the next
+        one. The recorded turns show exactly that loop, with Whisper
+        transcribing the reply as the next question.
+        """
+        self._muted = True
+        self.reset()
+
+    def unmute(self) -> None:
+        self._muted = False
+
+    @property
+    def muted(self) -> bool:
+        return self._muted
 
     # -- lifecycle -------------------------------------------------------
     def load(self) -> None:
@@ -87,7 +112,7 @@ class WakeWord:
 
     def feed(self, block: np.ndarray) -> float | None:
         """Push one block of float32 audio. Returns a score if the hotword fired."""
-        if self._model is None:
+        if self._model is None or self._muted:
             return None
         block = np.asarray(block, dtype=np.float32).reshape(-1)
         with self._lock:
