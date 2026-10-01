@@ -24,6 +24,30 @@ class TTSUnavailable(RuntimeError):
     pass
 
 
+# The output endpoint is shared, and SAPI needs it to itself. These wrap the
+# hand-off in audio.py so the failure is impossible to reintroduce by accident:
+# anything that speaks claims the endpoint first and returns it last, whatever
+# the caller does. The import is lazy and failure-tolerant, because a missing
+# numpy or a headless box must not stop the text mode from working.
+def _claim_output_endpoint() -> bool:
+    try:
+        from .audio import release_output_for_tts
+
+        return release_output_for_tts()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("could not claim the output endpoint for tts: %s", exc)
+        return False
+
+
+def _return_output_endpoint(rewarm: bool) -> None:
+    try:
+        from .audio import release_output_after_tts
+
+        release_output_after_tts(rewarm=rewarm)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("could not return the output endpoint: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Windows SAPI (pyttsx3)
 # ---------------------------------------------------------------------------
@@ -82,6 +106,13 @@ class SapiSpeaker:
             return
         self._speaking.set()
         try:
+            # Take the output endpoint before speaking. SAPI cannot share a
+            # Windows output endpoint with an open sounddevice OutputStream, and
+            # the symptom is not an error: the same call that takes 5.1s of
+            # speech with the endpoint free returns in 0.07s and renders nothing.
+            # The cue holds one of those streams open for the whole session, so
+            # without this the first reply can speak and every one after is mute.
+            _claim_output_endpoint()
             engine = self._ensure()
             engine.say(text)
             engine.runAndWait()
@@ -89,6 +120,14 @@ class SapiSpeaker:
             log.warning("speech failed: %s", exc)
         finally:
             self._speaking.clear()
+            # Deliberately not rewarming the cue stream. runAndWait() does not
+            # always block for the audio - it returns in ~0.3s sometimes and 5s
+            # other times - so the endpoint may still be playing when this runs,
+            # and reopening a competing OutputStream then cuts the sentence off
+            # at whatever word it had reached. The next cue reopens it lazily,
+            # which costs the ~200ms open, and a slightly late tick is a much
+            # better outcome than a truncated reply.
+            _return_output_endpoint(rewarm=False)
             if on_done:
                 on_done()
 

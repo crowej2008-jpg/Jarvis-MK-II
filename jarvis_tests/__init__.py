@@ -4521,6 +4521,151 @@ class TestFastPathRouting(unittest.TestCase):
         self.assertTrue(brain.calls[0], "an image skipped the tool block")
 
 
+class TestTtsTakesTheOutputEndpoint(unittest.TestCase):
+    """Speech and the cue cannot both hold the speakers, so speech goes first.
+
+    SAPI needs the Windows output endpoint to itself. While the cue's
+    OutputStream is open, engine.runAndWait() returns in 0.07s and renders
+    nothing at all - no error, no log line, just silence, which reads as a
+    broken speech engine. Measured on this machine with IAudioMeterInformation:
+    the same call on a worker thread reads peak 0.98 with the endpoint free and
+    0.00 with the cue stream open.
+
+    So speaking claims the endpoint, the cue stands down for the duration, and
+    the endpoint is handed back afterwards. These cases pin the hand-off, which
+    is the only part that can regress silently.
+    """
+
+    class FakeStream:
+        def __init__(self, log):
+            self.log = log
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def close(self):
+            self.log.append("closed")
+
+        def write(self, buf):
+            pass
+
+    def setUp(self):
+        from jarvis import audio
+
+        self.audio = audio
+        self.audio._ACK_STREAM = None
+        self.audio._ACK_STREAM_DEAD = False
+        self.audio._TTS_HOLDS_DEVICE = False
+        self.addCleanup(self._reset)
+
+    def _reset(self):
+        self.audio._ACK_STREAM = None
+        self.audio._ACK_STREAM_DEAD = False
+        self.audio._TTS_HOLDS_DEVICE = False
+
+    def test_speech_closes_the_cue_stream_before_talking(self):
+        from jarvis.tts import SapiSpeaker
+
+        events = []
+        speaker = SapiSpeaker()
+        speaker._engine = _FakeEngine(events)
+
+        class Stream(self.FakeStream):
+            def __init__(self):
+                super().__init__(events)
+
+        stream = Stream()
+        self.audio._ACK_STREAM = stream
+
+        speaker.speak("hello there")
+
+        self.assertIn("closed", events, "the cue stream was still held while speaking")
+        self.assertLess(events.index("closed"), events.index("say"),
+                        "the endpoint must be released before runAndWait")
+        self.assertEqual(events.index("closed"), 0,
+                         "closing the cue is the first thing that happens")
+
+    def test_the_endpoint_is_handed_back_after_speaking(self):
+        from jarvis.tts import SapiSpeaker
+
+        events = []
+        speaker = SapiSpeaker()
+        speaker._engine = _FakeEngine(events)
+        self.audio._ACK_STREAM = self.FakeStream(events)
+
+        speaker.speak("hello")
+
+        self.assertFalse(self.audio.tts_holds_device(),
+                         "the endpoint was never given back, so no cue can play")
+        self.assertFalse(self.audio._TTS_HOLDS_DEVICE)
+
+    def test_a_cue_during_speech_is_dropped_rather_than_killing_the_sentence(self):
+        self.audio._TTS_HOLDS_DEVICE = True
+        self.assertFalse(self.audio.play_ack("tick"))
+        self.assertIsNone(self.audio._ACK_STREAM,
+                          "the cue must not open a second stream over SAPI")
+
+    def test_warming_is_refused_while_speech_owns_the_endpoint(self):
+        import sounddevice as sd
+
+        real = sd.OutputStream
+        opened = []
+        sd.OutputStream = lambda **kw: (opened.append(kw),
+                                        self.FakeStream(opened))[1]
+        self.audio._TTS_HOLDS_DEVICE = True
+        try:
+            self.assertFalse(self.audio.warm_ack_stream())
+            self.assertEqual(opened, [], "it opened a stream over running speech")
+        finally:
+            sd.OutputStream = real
+
+    def test_the_cue_works_again_once_speech_is_done(self):
+        import sounddevice as sd
+
+        real = sd.OutputStream
+        sd.OutputStream = lambda **kw: self.FakeStream([])
+        try:
+            self.audio._TTS_HOLDS_DEVICE = False
+            self.assertTrue(self.audio.warm_ack_stream())
+        finally:
+            sd.OutputStream = real
+
+    def test_speech_survives_a_missing_audio_module(self):
+        """A headless box must still get text, even with no endpoint at all."""
+        from jarvis.tts import SapiSpeaker
+
+        events = []
+        speaker = SapiSpeaker()
+        speaker._engine = _FakeEngine(events)
+        real_release = self.audio.release_output_for_tts
+
+        def boom():
+            raise OSError("no audio device")
+
+        self.audio.release_output_for_tts = boom
+        try:
+            speaker.speak("still speak me")
+            self.assertIn("say", events, "speech gave up over a missing device")
+        finally:
+            self.audio.release_output_for_tts = real_release
+
+
+class _FakeEngine:
+    """Stands in for pyttsx3, recording the order of the calls that matter."""
+
+    def __init__(self, events):
+        self.events = events
+
+    def say(self, text):
+        self.events.append("say")
+
+    def runAndWait(self):
+        self.events.append("runAndWait")
+
+
 class TestAcknowledgeCue(unittest.TestCase):
     """The 'I heard you' cue, and the claim that it can beat 50ms."""
 

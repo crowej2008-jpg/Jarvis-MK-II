@@ -370,6 +370,59 @@ _ACK_STREAM: Any = None
 _ACK_STREAM_RATE = 0
 _ACK_STREAM_DEAD = False
 
+# Set while TTS is speaking, so the cue cannot take the endpoint back mid
+# sentence. Read without the lock: a bool read is atomic, and the lock is only
+# ever held around the two transitions.
+_TTS_HOLDS_DEVICE = False
+
+
+def tts_holds_device() -> bool:
+    """True while speech is using the output endpoint."""
+    return _TTS_HOLDS_DEVICE
+
+
+def release_output_for_tts() -> bool:
+    """Hand the output endpoint to TTS. True if a cue stream was held.
+
+    SAPI and a held sounddevice OutputStream cannot share one Windows output
+    endpoint. With the cue stream open, engine.runAndWait() returns in 0.07s and
+    nothing is rendered at all; closing it first, the same call on the same
+    worker thread runs for the full 4.8s and the endpoint peak meter reads 0.98.
+    Measured here with IAudioMeterInformation, not inferred, because the failure
+    is silent and looks exactly like a broken speech engine.
+
+    The cue is also barred from reopening the endpoint until
+    release_output_after_tts() says speech is over, or a cue fired mid sentence
+    would silence the reply it is meant to precede.
+    """
+    global _TTS_HOLDS_DEVICE
+    _TTS_HOLDS_DEVICE = True
+    held = _ACK_STREAM is not None
+    if held:
+        close_ack_stream()
+    return held
+
+
+def release_output_after_tts(rewarm: bool = True) -> None:
+    """Give the endpoint back once speech has finished.
+
+    `rewarm` reopens the cue stream, which costs the ~200ms open this module
+    works so hard to hide, so it is only worth doing when the cue stream was
+    actually held before the speech started.
+    """
+    global _TTS_HOLDS_DEVICE
+    _TTS_HOLDS_DEVICE = False
+    if rewarm:
+        # Wait for any trailing audio to flush, otherwise the new OutputStream
+        # can start up mid-tail and corrupt the next attempt.
+        try:
+            import time
+
+            time.sleep(0.15)
+        except Exception:  # noqa: BLE001
+            pass
+        warm_ack_stream()
+
 
 def warm_ack_stream(rate: int = 16000) -> bool:
     """Open the cue output stream ahead of time, while nothing is waiting.
@@ -382,6 +435,10 @@ def warm_ack_stream(rate: int = 16000) -> bool:
     with _ACK_LOCK:
         if _ACK_STREAM is not None or _ACK_STREAM_DEAD:
             return _ACK_STREAM is not None
+        if not _can_claim_endpoint():
+            # Speech is using the speakers. Warming now would starve it, and the
+            # next cue would simply wait instead.
+            return False
         try:
             import sounddevice as sd
 
@@ -404,6 +461,14 @@ def warm_ack_stream(rate: int = 16000) -> bool:
         return True
 
 
+def _can_claim_endpoint() -> bool:
+    # While TTS is speaking, do not open a second OutputStream. SAPI needs the
+    # endpoint exclusively on this machine, and opening a new one kills the
+    # sentence that is in progress.
+    return not _TTS_HOLDS_DEVICE
+
+
+
 def play_ack(name: str, rate: int = 16000) -> bool:
     """Play an acknowledgement cue. Returns True if a sound was made.
 
@@ -416,6 +481,10 @@ def play_ack(name: str, rate: int = 16000) -> bool:
     try:
         wave = ack_tone(name, rate)
         if wave is None:
+            return False
+        if not _can_claim_endpoint():
+            # Mid sentence. A cue now would cost the user the reply it is
+            # meant to precede, so it is dropped.
             return False
 
         import sounddevice as sd
