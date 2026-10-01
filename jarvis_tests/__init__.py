@@ -3342,6 +3342,127 @@ class TestDangerousToolsReallyAsk(unittest.TestCase):
         self.assertIn("blocked", str(ctx.exception))
 
 
+class TestOpenAppResolution(unittest.TestCase):
+    """The install-directory search, which was broken and never covered.
+
+    open_app fell through to the Start Menu fallback for every program installed
+    under "Program Files" or in a per-user directory, because the glob was built
+    by string-joining a '*' into a path and then treated as a literal segment.
+    It also raised NameError on the way, since the loop variable was never bound.
+    Both were invisible because nothing here called the function past a name that
+    PATH already resolves, so notepad looked fine while VS Code did not.
+
+    Nothing launches anything: Popen is replaced.
+    """
+
+    def setUp(self):
+        from unittest import mock
+
+        from jarvis.tools import load_all, system_tools
+
+        load_all()
+        self.tools = system_tools
+        self.mock = mock
+        system_tools.set_approver(lambda name, detail: True)
+        self.addCleanup(system_tools.set_approver, None)
+        self.popen = mock.patch.object(system_tools.subprocess, "Popen").start()
+        self.addCleanup(mock.patch.stopall)
+        # Nothing is really on disk, and PATH is empty, so resolution has to come
+        # from the install directories this test controls.
+        self.which = mock.patch.object(system_tools.shutil, "which",
+                                       return_value=None).start()
+
+    def test_the_wildcard_is_a_pattern_and_not_a_path_segment(self):
+        """A glob built by joining '*' into the path matches nothing at all."""
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "Programs"
+            app = base / "VS Code" / "Code.exe"
+            app.parent.mkdir(parents=True)
+            app.write_bytes(b"")
+
+            # The old shape: '*' becomes a literal directory name.
+            broken = str(base / "*" / "Code.exe")
+            self.assertEqual(
+                list(Path(broken).parent.glob(Path(broken).name)), [],
+                "this is the bug: the broken form is expected to find nothing",
+            )
+            # The shape the fix uses.
+            self.assertEqual(
+                [str(h) for h in base.glob("*/Code.exe")],
+                [str(app)],
+            )
+
+    def test_an_app_one_level_down_is_found_and_launched(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "Programs"
+            exe = base / "Microsoft VS Code" / "Code.exe"
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b"")
+            env = {"LOCALAPPDATA": str(tmp), "ProgramFiles": "",
+                   "ProgramFiles(x86)": ""}
+            with self.mock.patch.dict(os.environ, env, clear=False):
+                result = self.tools.open_app("Code.exe")
+            self.assertEqual(result["how"], "glob")
+            self.assertEqual(result["opened"], str(exe))
+            self.popen.assert_called_once_with([str(exe)])
+
+    def test_an_app_sitting_directly_in_the_base_is_found(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "Microsoft" / "WindowsApps"
+            base.mkdir(parents=True)
+            exe = base / "something.exe"
+            exe.write_bytes(b"")
+            env = {"LOCALAPPDATA": tmp, "ProgramFiles": "",
+                   "ProgramFiles(x86)": ""}
+            with self.mock.patch.dict(os.environ, env, clear=False):
+                result = self.tools.open_app("something.exe")
+            self.assertEqual(result["opened"], str(exe))
+            self.popen.assert_called_once_with([str(exe)])
+
+    def test_a_missing_base_directory_is_skipped_rather_than_raising(self):
+        import os
+
+        env = {"LOCALAPPDATA": r"Z:\definitely\not\here",
+               "ProgramFiles": r"Z:\nope", "ProgramFiles(x86)": ""}
+        with self.mock.patch.dict(os.environ, env, clear=False):
+            result = self.tools.open_app("no-such-app-xyz.exe")
+        # Falls through to the shell fallback rather than raising.
+        self.assertEqual(result["how"], "start-menu-fallback")
+
+    def test_a_missing_app_does_not_report_success(self):
+        result = self.tools.open_app("definitely-not-installed-xyz.exe")
+        self.assertIn("note", result, "a failed open must say so")
+        # The only launch it may attempt is the Start Menu shell fallback, and
+        # never the app itself.
+        for call in self.popen.call_args_list:
+            self.assertNotIn("definitely-not-installed-xyz.exe",
+                             call.args[0],
+                             "it claimed to open an app that does not exist")
+
+    def test_an_absolute_existing_path_still_wins(self):
+        import tempfile
+        from pathlib import Path
+
+        startfile = self.mock.patch.object(self.tools.os, "startfile").start()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "thing.exe"
+            exe.write_bytes(b"")
+            result = self.tools.open_app(str(exe))
+            self.assertEqual(result["how"], "filesystem")
+            startfile.assert_called_once_with(str(exe))
+
+
 class TestKillProcessAndAbort(unittest.TestCase):
     """kill_process and abort_shutdown force things and had no coverage at all.
     Nothing here touches a real process: Popen, run, and psutil are replaced."""

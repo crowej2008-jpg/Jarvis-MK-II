@@ -239,16 +239,29 @@ def open_app(target: str) -> dict[str, Any]:
             subprocess.Popen([found])
             return {"opened": found, "how": "path-lookup"}
 
-        for pattern in (
-            str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "*/" / name),
-            str(Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "*/" / name),
-            str(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "*/" / name),
-            str(Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/WindowsApps" / name),
-        ):
-            hits = sorted(Path(p).parent.glob(Path(p).name))
-            if hits:
-                subprocess.Popen([str(hits[0])])
-                return {"opened": str(hits[0]), "how": "glob"}
+        # Glob the executable name as a pattern against each base directory.
+        # Building the whole path first and calling .parent.glob() looks right
+        # and never matches, because the '*' ends up as a literal path segment
+        # rather than as part of the pattern, so the search silently finds
+        # nothing and the tool falls through to the Start Menu every time.
+        bases = (
+            os.environ.get("ProgramFiles", ""),
+            os.environ.get("ProgramFiles(x86)", ""),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                         "Microsoft", "WindowsApps"),
+        )
+        for base in bases:
+            if not base or not os.path.isdir(base):
+                continue
+            # One level down catches "Program Files\\Microsoft VS Code\\Code.exe"
+            # without walking the whole tree, and the bare name catches the apps
+            # that install directly into the base.
+            for hits in (sorted(Path(base).glob(f"*/{name}")),
+                         sorted(Path(base).glob(name))):
+                if hits:
+                    subprocess.Popen([str(hits[0])])
+                    return {"opened": str(hits[0]), "how": "glob"}
 
     # Last resort: let the Windows shell search Start Menu for it.
     try:
